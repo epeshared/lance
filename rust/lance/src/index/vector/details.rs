@@ -27,7 +27,7 @@ use lance_table::format::IndexMetadata;
 use serde::Serialize;
 
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
-use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::hnsw::builder::{DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE, HnswBuildParams};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
@@ -258,6 +258,14 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
         m: h.max_connections as usize,
         ef_construction: h.construction_ef as usize,
         max_level: h.max_level as u16,
+        use_exact_knn_construction: h.exact_knn_construction,
+        // Zero is what an index written before the field existed carries, and
+        // it would otherwise read as "no partition qualifies".
+        exact_knn_max_partition_size: if h.exact_knn_max_partition_size > 0 {
+            h.exact_knn_max_partition_size as usize
+        } else {
+            DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE
+        },
         ..Default::default()
     });
 
@@ -626,11 +634,7 @@ async fn convert_v3_metadata_to_details(
             .and_then(|entries| entries.into_iter().next())
             .map(|s| serde_json::from_str::<HnswMetadata>(&s))
             .transpose()?
-            .map(|hnsw| HnswParameters {
-                max_connections: hnsw.params.m as u32,
-                construction_ef: hnsw.params.ef_construction as u32,
-                max_level: hnsw.params.max_level as u32,
-            })
+            .map(|hnsw| HnswParameters::from(&hnsw.params))
     } else {
         None
     };
@@ -780,12 +784,43 @@ mod tests {
         }
     }
 
+    /// Indices written before the exact-knn fields existed carry proto defaults,
+    /// and a zero ceiling would read as "no partition qualifies" rather than
+    /// "unset".
+    #[test]
+    fn test_hnsw_params_from_legacy_details_use_defaults() {
+        use crate::index::vector::StageParams;
+        use lance_index::vector::hnsw::builder::DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE;
+
+        let details = make_details(
+            VectorMetricType::L2,
+            Some(HnswParameters {
+                max_connections: 20,
+                construction_ef: 150,
+                max_level: 7,
+                exact_knn_construction: false,
+                exact_knn_max_partition_size: 0,
+            }),
+            None,
+        );
+        let restored = vector_params_from_details(&details).unwrap();
+        let StageParams::Hnsw(hnsw) = &restored.stages[1] else {
+            panic!("expected HNSW stage");
+        };
+        assert!(!hnsw.use_exact_knn_construction);
+        assert_eq!(
+            hnsw.exact_knn_max_partition_size,
+            DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE
+        );
+    }
+
     #[test]
     fn test_derive_index_type_with_hnsw() {
         let hnsw = Some(HnswParameters {
             max_connections: 20,
             construction_ef: 150,
             max_level: 7,
+            ..Default::default()
         });
         assert_eq!(
             derive_vector_index_type(&make_details(VectorMetricType::L2, hnsw, None)),
@@ -845,6 +880,7 @@ mod tests {
                 max_connections: 30,
                 construction_ef: 200,
                 max_level: 8,
+                ..Default::default()
             }),
             Some(Compression::Sq(ScalarQuantization { num_bits: 4 })),
         );
@@ -1237,6 +1273,7 @@ mod tests {
             ef_construction: 150,
             max_level: 6,
             prefetch_distance: Some(4),
+            ..Default::default()
         };
         let mut params = VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
@@ -1299,6 +1336,7 @@ mod tests {
             ef_construction: 100,
             max_level: 5,
             prefetch_distance: None,
+            ..Default::default()
         };
         let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
 
@@ -1383,6 +1421,8 @@ mod tests {
             ef_construction: 200,
             max_level: 5,
             prefetch_distance: Some(2),
+            use_exact_knn_construction: true,
+            exact_knn_max_partition_size: 12_345,
         };
         let pq = PQBuildParams {
             num_sub_vectors: 8,
@@ -1491,6 +1531,11 @@ mod tests {
                 assert_eq!(hnsw.m, 30);
                 assert_eq!(hnsw.ef_construction, 200);
                 assert_eq!(hnsw.max_level, 5);
+                // Appending to an index derives the new segment's parameters
+                // from here, so a build strategy that does not survive the round
+                // trip is silently dropped on the second segment.
+                assert!(hnsw.use_exact_knn_construction);
+                assert_eq!(hnsw.exact_knn_max_partition_size, 12_345);
             }
             Combo::IvfHnswPq => {
                 let StageParams::Hnsw(hnsw) = &restored.stages[1] else {
@@ -1499,6 +1544,11 @@ mod tests {
                 assert_eq!(hnsw.m, 30);
                 assert_eq!(hnsw.ef_construction, 200);
                 assert_eq!(hnsw.max_level, 5);
+                // Appending to an index derives the new segment's parameters
+                // from here, so a build strategy that does not survive the round
+                // trip is silently dropped on the second segment.
+                assert!(hnsw.use_exact_knn_construction);
+                assert_eq!(hnsw.exact_knn_max_partition_size, 12_345);
                 let StageParams::PQ(pq) = &restored.stages[2] else {
                     panic!("expected PQ stage");
                 };
@@ -1512,6 +1562,11 @@ mod tests {
                 assert_eq!(hnsw.m, 30);
                 assert_eq!(hnsw.ef_construction, 200);
                 assert_eq!(hnsw.max_level, 5);
+                // Appending to an index derives the new segment's parameters
+                // from here, so a build strategy that does not survive the round
+                // trip is silently dropped on the second segment.
+                assert!(hnsw.use_exact_knn_construction);
+                assert_eq!(hnsw.exact_knn_max_partition_size, 12_345);
                 let StageParams::SQ(sq) = &restored.stages[2] else {
                     panic!("expected SQ stage");
                 };

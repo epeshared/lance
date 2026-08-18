@@ -17,6 +17,7 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
 };
 use arrow_schema::{DataType, SchemaRef};
+use half::f16;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
@@ -122,6 +123,24 @@ impl FlatFloatStorage {
 
     pub fn vector(&self, id: u32) -> ArrayRef {
         self.vectors.value(id as usize)
+    }
+
+    /// The whole partition as one contiguous row-major `[len(), dim]` `f16`
+    /// slice, together with `dim`.
+    ///
+    /// `None` unless the vectors really are `Float16` and really are laid out
+    /// as one unsliced, non-null run — the same flat `dim * id` addressing
+    /// [`FlatDistanceCal`] relies on. Callers that want to hand the whole
+    /// partition to a batched kernel need the backing buffer rather than the
+    /// per-row [`Self::vector`], and must be able to decline when the layout
+    /// does not allow it.
+    pub(crate) fn f16_vectors(&self) -> Option<(&[f16], usize)> {
+        let dim = self.vectors.value_length() as usize;
+        let values = self.vectors.values().as_primitive_opt::<Float16Type>()?;
+        if values.null_count() > 0 || values.len() != self.vectors.len() * dim {
+            return None;
+        }
+        Some((values.values(), dim))
     }
 }
 

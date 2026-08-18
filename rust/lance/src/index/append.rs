@@ -2389,6 +2389,7 @@ mod tests {
                     m: 12,
                     ef_construction: 80,
                     prefetch_distance: Some(1),
+                    ..Default::default()
                 }
             ),
             VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -2399,6 +2400,7 @@ mod tests {
                     m: 12,
                     ef_construction: 80,
                     prefetch_distance: Some(1),
+                    ..Default::default()
                 },
                 PQBuildParams {
                     num_sub_vectors: 4,
@@ -2413,6 +2415,7 @@ mod tests {
                     m: 12,
                     ef_construction: 80,
                     prefetch_distance: Some(1),
+                    ..Default::default()
                 },
                 SQBuildParams::default()
             )

@@ -16,6 +16,8 @@ use super::graph::OrderedNode;
 use super::storage::VectorStore;
 
 pub mod builder;
+pub(crate) mod exact_build;
+pub(crate) mod exact_knn;
 pub mod index;
 pub mod online;
 

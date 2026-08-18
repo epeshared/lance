@@ -15,7 +15,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use std::cmp::min;
+use std::cmp::{Reverse, min};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -29,7 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
 use super::{
-    HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
+    HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, exact_build,
+    select_neighbors_heuristic_owned,
 };
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
@@ -70,6 +71,22 @@ pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: 
     )
 }
 
+/// Default for [`HnswBuildParams::exact_knn_max_partition_size`].
+///
+/// The exact-neighbour path spends `O(n^2)` distances on a partition, while
+/// incremental insertion spends a per-node amount that stops growing once the
+/// graph is big enough for a fixed-`ef_construction` beam to visit a bounded
+/// number of nodes (measured flat at ~2400-2600 distances per node from
+/// `n = 20_000` up to `n = 365_000`). The two therefore cross over, measured
+/// between 103k and 130k vectors depending on the partition. This default sits
+/// below that with margin, at roughly the p99 partition size of a production
+/// IVF index.
+pub const DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE: usize = 70_000;
+
+fn default_exact_knn_max_partition_size() -> usize {
+    DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE
+}
+
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
@@ -84,6 +101,35 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
+
+    /// Take each node's candidate neighbours from an exact top-`ef_construction`
+    /// table computed for the whole partition up front, instead of beam
+    /// searching the partly-built graph once per insertion.
+    ///
+    /// This is a request, not a guarantee: the path additionally needs `f16`
+    /// vectors under [`DistanceType::Dot`], a host and build where the AMX-FP16
+    /// GEMM is usable, and a partition of at most
+    /// [`Self::exact_knn_max_partition_size`] vectors. When any of those is
+    /// missing the build falls back to incremental insertion, so leaving this on
+    /// is always safe.
+    ///
+    /// Only how the graph is built changes: the graph shape, the on-disk format
+    /// and the search path are the same either way. It still rides along in both
+    /// the index's HNSW metadata and [`crate::pb::HnswParameters`], because
+    /// appending to an index derives the new segment's parameters from what was
+    /// recorded there — without it, the second segment would silently be built
+    /// the other way. `serde(default)` keeps indices written before the field
+    /// existed readable.
+    #[serde(default)]
+    pub use_exact_knn_construction: bool,
+
+    /// Largest partition, in vectors, that [`Self::use_exact_knn_construction`]
+    /// applies to; bigger partitions fall back to incremental insertion.
+    ///
+    /// Defaults to [`DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE`], which documents
+    /// where the two costs cross. Ignored when the exact path is off.
+    #[serde(default = "default_exact_knn_max_partition_size")]
+    pub exact_knn_max_partition_size: usize,
 }
 
 impl From<&HnswBuildParams> for crate::pb::HnswParameters {
@@ -92,6 +138,8 @@ impl From<&HnswBuildParams> for crate::pb::HnswParameters {
             max_connections: params.m as u32,
             construction_ef: params.ef_construction as u32,
             max_level: params.max_level as u32,
+            exact_knn_construction: params.use_exact_knn_construction,
+            exact_knn_max_partition_size: params.exact_knn_max_partition_size as u64,
         }
     }
 }
@@ -103,6 +151,8 @@ impl Default for HnswBuildParams {
             m: 20,
             ef_construction: 150,
             prefetch_distance: Some(2),
+            use_exact_knn_construction: false,
+            exact_knn_max_partition_size: DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE,
         }
     }
 }
@@ -131,6 +181,23 @@ impl HnswBuildParams {
     /// The default value is `150`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
+        self
+    }
+
+    /// Ask for the exact-neighbour construction path; see
+    /// [`Self::use_exact_knn_construction`] for what it still has to pass.
+    ///
+    /// The default value is `false`.
+    pub fn with_exact_knn_construction(mut self, enabled: bool) -> Self {
+        self.use_exact_knn_construction = enabled;
+        self
+    }
+
+    /// Partition-size ceiling for the exact-neighbour path.
+    ///
+    /// The default value is [`DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE`].
+    pub fn with_exact_knn_max_partition_size(mut self, max_partition_size: usize) -> Self {
+        self.exact_knn_max_partition_size = max_partition_size;
         self
     }
 
@@ -674,6 +741,35 @@ impl HNSW {
     }
 }
 
+/// How many levels each of `len` nodes takes part in: node `i` lives on levels
+/// `0..levels[i]`, so the entry is always at least 1 and at most
+/// `params.max_level`.
+///
+/// Every node draws from the HNSW level distribution (paper `Algorithm 1`) off
+/// [`HNSW_LEVEL_RNG_SEED`]. Shared by both construction paths so a graph's
+/// shape depends only on `len` and `params`, never on which path built it.
+///
+/// `params.max_level` must be non-zero, which [`HnswBuildParams::validate`]
+/// already requires of every build.
+pub(crate) fn assign_node_levels(len: usize, params: &HnswBuildParams) -> Vec<usize> {
+    let mut rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
+    (0..len)
+        .map(|_| random_level_with(params, &mut rng) as usize + 1)
+        .collect()
+}
+
+/// The node a search starts from: the one on the most levels, lowest id
+/// breaking ties. Both construction paths derive it this way, so the two agree
+/// on the entry point for the same `levels`.
+pub(crate) fn entry_point_of(levels: &[usize]) -> u32 {
+    levels
+        .iter()
+        .enumerate()
+        .max_by_key(|&(id, &node_levels)| (node_levels, Reverse(id)))
+        .map(|(id, _)| id as u32)
+        .unwrap_or(0)
+}
+
 struct HnswBuilder {
     params: HnswBuildParams,
 
@@ -756,20 +852,13 @@ impl HnswBuilder {
             return builder;
         }
 
-        let mut nodes = Vec::with_capacity(len);
-        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
-        let mut highest_level = 0;
-        for i in 0..len {
-            let target_level = random_level_with(&builder.params, &mut level_rng);
-            if target_level > highest_level {
-                highest_level = target_level;
-                builder.entry_point = i as u32;
-            }
-            nodes.push(RwLock::new(GraphBuilderNode::new(
-                i as u32,
-                target_level as usize + 1,
-            )));
-        }
+        let levels = assign_node_levels(len, &builder.params);
+        builder.entry_point = entry_point_of(&levels);
+        let nodes = levels
+            .into_iter()
+            .enumerate()
+            .map(|(id, node_levels)| RwLock::new(GraphBuilderNode::new(id as u32, node_levels)))
+            .collect();
         builder.nodes = Arc::new(nodes);
 
         builder
@@ -1424,6 +1513,14 @@ impl IvfSubIndex for HNSW {
             return Ok(builder.finish());
         }
 
+        // Same graph, built from an exact neighbour table rather than one beam
+        // search per insertion. Opt-in and conditional on the partition -- it
+        // answers `None` for anything it cannot serve, which is a fallback and
+        // not a failure.
+        if let Some(hnsw) = exact_build::build_from_exact_knn(storage, &builder.params)? {
+            return Ok(hnsw);
+        }
+
         let len = storage.len();
         let entry_levels = builder.nodes[builder.entry_point as usize]
             .read()
@@ -1539,7 +1636,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, RecordBatch, UInt8Array,
+        UInt32Array,
     };
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
@@ -1557,9 +1655,10 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
+    use super::super::exact_build;
     use super::{
-        HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
-        ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
+        DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE, HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder,
+        HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
@@ -1998,6 +2097,7 @@ mod tests {
             m: 4,
             ef_construction: 10,
             prefetch_distance: None,
+            ..Default::default()
         };
         let hnsw = HNSW::from_parts(build_params, nodes.clone(), vec![N, 1], 0);
         let query_params = HnswQueryParams {
@@ -2383,6 +2483,21 @@ mod tests {
         }
     }
 
+    /// `HnswBuildParams` is serialized into every index file's HNSW metadata, so
+    /// an index written before the exact-knn knobs existed still has to load,
+    /// with those knobs at their defaults.
+    #[test]
+    fn test_params_deserialize_without_exact_knn_fields() {
+        let legacy = r#"{"max_level":7,"m":20,"ef_construction":150,"prefetch_distance":2}"#;
+        let params: HnswBuildParams = serde_json::from_str(legacy).unwrap();
+        assert_eq!(params.m, 20);
+        assert!(!params.use_exact_knn_construction);
+        assert_eq!(
+            params.exact_knn_max_partition_size,
+            DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE
+        );
+    }
+
     /// Indices written before issue #5156 was fixed omitted the entry point
     /// from every upper-level count. Loading those misaligned slices must keep
     /// the previous id-keyed, last-write-wins behavior.
@@ -2673,5 +2788,50 @@ mod tests {
             loaded.deep_size_of(),
             builder.deep_size_of(),
         );
+    }
+
+    /// `index_vectors` has to route an eligible partition to the exact-neighbour
+    /// path and everything else to incremental insertion, with no error either
+    /// way. The exact path's own behaviour is covered in
+    /// [`super::super::exact_build`]; what is checked here is only the handoff.
+    #[test]
+    fn test_index_vectors_routes_to_exact_knn_when_eligible() {
+        const DIM: usize = 64;
+        const TOTAL: usize = 512;
+        let values = Float16Array::from_iter_values(
+            generate_random_array(TOTAL * DIM)
+                .values()
+                .iter()
+                .map(|v| half::f16::from_f32(*v)),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::Dot);
+        let params = HnswBuildParams::default()
+            .num_edges(8)
+            .ef_construction(32)
+            .with_exact_knn_construction(true);
+
+        let routed = exact_build::build_from_exact_knn(&store, &params).unwrap();
+        let hnsw = HNSW::index_vectors(&store, params.clone()).unwrap();
+        assert_eq!(hnsw.len(), TOTAL);
+        // `None` means no AMX on this host, and the only correct outcome is then
+        // an incrementally built graph -- which the assertion above covers.
+        // Otherwise `index_vectors` must have produced exactly what the exact
+        // path produces, not a separately inserted graph.
+        if let Some(expected) = routed {
+            assert_eq!(
+                hnsw.nodes().unwrap().first().unwrap().level_neighbors,
+                expected.nodes().unwrap().first().unwrap().level_neighbors,
+            );
+        }
+
+        // Over the size ceiling, the flag must not change the outcome.
+        let capped = params.with_exact_knn_max_partition_size(TOTAL - 1);
+        assert!(
+            exact_build::build_from_exact_knn(&store, &capped)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(HNSW::index_vectors(&store, capped).unwrap().len(), TOTAL);
     }
 }

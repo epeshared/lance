@@ -47,7 +47,7 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     VectorIndex,
     hnsw::{
-        builder::HnswBuildParams,
+        builder::{DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE, HnswBuildParams},
         index::{HNSWIndex, HNSWIndexOptions},
     },
     ivf::IvfBuildParams,
@@ -2035,6 +2035,7 @@ pub(crate) fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildPar
         m: 20,
         ef_construction: 100,
         prefetch_distance: None,
+        ..Default::default()
     };
 
     let Ok(stats) = source_index.statistics() else {
@@ -2066,12 +2067,26 @@ pub(crate) fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildPar
             .get("prefetch_distance")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        // Carried over so a new segment is built the same way as the one it
+        // extends; both are absent from indices written before the fields
+        // existed, which is what the defaults cover.
+        let use_exact_knn_construction = params
+            .get("use_exact_knn_construction")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let exact_knn_max_partition_size = params
+            .get("exact_knn_max_partition_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_EXACT_KNN_MAX_PARTITION_SIZE);
 
         return HnswBuildParams {
             max_level,
             m,
             ef_construction,
             prefetch_distance,
+            use_exact_knn_construction,
+            exact_knn_max_partition_size,
         };
     }
 
@@ -2278,6 +2293,7 @@ mod tests {
                 m: 24,
                 ef_construction: 120,
                 prefetch_distance: None,
+                ..Default::default()
             },
             PQBuildParams {
                 num_sub_vectors: 8,
@@ -3424,6 +3440,7 @@ mod tests {
             m: 24,
             ef_construction: 120,
             prefetch_distance: None,
+            ..Default::default()
         };
         let pq_params = PQBuildParams {
             num_sub_vectors: 8,
@@ -3675,6 +3692,7 @@ mod tests {
             m: 16,
             ef_construction: 80,
             prefetch_distance: None,
+            ..Default::default()
         };
         let sq_params = SQBuildParams {
             num_bits: 8,

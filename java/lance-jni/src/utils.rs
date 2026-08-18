@@ -405,6 +405,7 @@ pub fn get_vector_index_params(
                         m,
                         ef_construction,
                         prefetch_distance,
+                        ..Default::default()
                     })
                 },
             )?;
