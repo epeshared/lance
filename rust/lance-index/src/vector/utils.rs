@@ -12,7 +12,8 @@ use arrow_schema::{DataType, Field};
 use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
-use lance_linalg::distance::dot_f16::amx_fp16_available;
+use lance_linalg::distance::dot_f16::{amx_fp16_available, amx_fp32_cast_available};
+use log::{debug, warn};
 use prost::bytes;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
@@ -45,8 +46,52 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
     }
 });
 
-/// Whether partition assignment is better served by the exact flat path than by
-/// an approximate lookup through this index.
+/// How many centroid values (`num_centroids * dimension`) it takes before an
+/// approximate index over the centroids pays for the cost of building it.
+/// Benchmarked at 1024 centroids x 1024 dimensions, where it made assignment 2x
+/// faster; below this the flat scan wins on its own.
+const MIN_CENTROID_VALUES_FOR_INDEX: usize = 1_000_000;
+
+/// Which routes onto the AMX-FP16 kernel are in service, as the two kill
+/// switches leave them.
+///
+/// Passed in rather than read inside the routing functions so the routing table
+/// can be tested by enumeration. Read from the environment, a test can only
+/// assert that a function returns what the very function it calls returns —
+/// which holds however the routing is wired, including wrongly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AmxAvailability {
+    /// An f16 column may use the kernel directly: `amx_fp16_available()`.
+    pub(crate) native: bool,
+    /// An fp32 column may be rounded onto it: `amx_fp32_cast_available()`.
+    /// Never true while `native` is false — `LANCE_DISABLE_AMX` outranks
+    /// `LANCE_AMX_FP32_CAST` — but the routing code does not rely on that.
+    pub(crate) rounded: bool,
+}
+
+impl AmxAvailability {
+    /// What the two kill switches say in this process. The only place
+    /// production routing reads them; everything below takes the answer as an
+    /// argument.
+    pub(crate) fn current() -> Self {
+        Self {
+            native: amx_fp16_available(),
+            rounded: amx_fp32_cast_available(),
+        }
+    }
+}
+
+/// What stands between partition assignment and the exact flat path, or `None`
+/// when that path is better served than an approximate lookup through this index
+/// and nothing blocks it.
+///
+/// The reason is returned rather than folded into a `bool` because it is the
+/// only thing that distinguishes the arms of an A/B run in the log. Whether the
+/// fp32 cast was in play is expected *not* to show up in the k-means loss — that
+/// is the result the cast exists to produce — so the loss cannot confirm which
+/// path a build took, and the reason string is what does. It is also what an
+/// operator asking "why did my fp32 build go approximate" needs; a `false` on
+/// its own answers nothing.
 ///
 /// The index turns one `M x N` problem -- every vector against every centroid --
 /// into `M` independent top-1 graph searches. Each search walks its own path, so
@@ -69,23 +114,140 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
 /// some vectors land in a partition that is not their nearest and no `nprobes`
 /// setting recovers them. Flat assignment is exact.
 ///
+/// An fp32 column qualifies too, by rounding each block of vectors to f16 on the
+/// way into the GEMM. Rounding moves some assignments, but far less than the
+/// approximate graph lookup does: measured on 990k x 1536 real OpenAI embeddings
+/// (dbpedia) against 2048 centroids, 0.231% of vectors landed on a different
+/// centroid, the k-means loss moved by +0.0001%, and the vectors that moved paid
+/// 7.9e-5 more distance against an average of 0.208 — four parts in ten
+/// thousand. The data is nowhere near f16's range limits either (max |v| = 0.689
+/// against a ceiling of 65504), with 0.27% of elements landing in the subnormal
+/// range. Assignment then stays exact in a stronger sense than the graph lookup
+/// can offer: the winner is picked from f16 scores, but the *distance* reported
+/// for it is recomputed in fp32, so k-means' loss stays comparable with the
+/// exact path's. Anything that does not round cleanly falls back per block.
+///
 /// The conditions below must stay in lockstep with the AMX gate in
 /// `compute_membership_and_dist`; without the GEMM the flat path is ~2.7x slower
 /// than the index (5361s vs 2011s at k=10000), so a mismatch here is expensive.
-/// That includes the `LANCE_DISABLE_AMX` kill switch, which both consult through
-/// [`amx_fp16_available`]: an operator turning AMX off has to move this decision
-/// too, or the build would take the exact-assignment path with no GEMM under it.
-fn prefers_flat_amx_assignment(
+/// That includes both kill switches, which the two sides consult through the
+/// same [`amx_fp16_available`] / [`amx_fp32_cast_available`] pair: an operator
+/// turning either off has to move this decision too, or the build would take the
+/// exact-assignment path with no GEMM under it.
+///
+/// The conditions are tested in the gate's own order and the first failure wins,
+/// so an operator gets one answer rather than a list.
+fn flat_amx_assignment_blocker(
     centroid_type: &DataType,
     num_centroids: usize,
     dimension: usize,
     distance_type: DistanceType,
-) -> bool {
-    centroid_type == &DataType::Float16
-        && distance_type == DistanceType::Dot
-        && dimension >= 32
-        && num_centroids >= 32
-        && amx_fp16_available()
+    amx: AmxAvailability,
+) -> Option<&'static str> {
+    if distance_type != DistanceType::Dot {
+        return Some("the distance type is not dot");
+    }
+    if dimension < 32 {
+        return Some("the dimension is below one 32-wide k-pass");
+    }
+    if num_centroids < 32 {
+        return Some("the centroid count is below one 32-centroid block");
+    }
+    match centroid_type {
+        DataType::Float16 if amx.native => None,
+        DataType::Float32 if amx.rounded => None,
+        // Distinguishing the two switches matters: the fp32 one is the arm of
+        // an A/B measurement, and reporting it as "AMX is off" would make the
+        // control arm indistinguishable from a host that simply has no AMX.
+        DataType::Float32 if amx.native => Some("LANCE_AMX_FP32_CAST is off"),
+        DataType::Float16 | DataType::Float32 => Some(
+            "AMX-FP16 is unavailable: no kernel in this build, no support on this CPU, or LANCE_DISABLE_AMX is on",
+        ),
+        _ => Some("the centroid type is neither float16 nor float32"),
+    }
+}
+
+/// Which way one round of partition assignment goes, and why — the payload of
+/// the `debug!` line in [`SimpleIndex::may_train_index`].
+///
+/// The three routes are not interchangeable: `flat+amx` is exact and fast,
+/// `flat` is exact and ~2.7x slower, `hnsw` is approximate and loses recall no
+/// `nprobes` setting recovers. Which one a build took is worth a line in the log
+/// because nothing else reveals it — least of all the k-means loss, which the
+/// fp32 cast is designed to leave unchanged.
+struct AssignmentRoute {
+    /// Whether to train the approximate centroid index.
+    train_index: bool,
+    /// `flat+amx`, `flat` or `hnsw`.
+    route: &'static str,
+    /// Why this route rather than another.
+    reason: &'static str,
+    /// What keeps the AMX-FP16 GEMM out from under assignment, or `None` when it
+    /// is in play. Carried separately from `reason` because it is reported even
+    /// when it did not decide the route: on a centroid set below
+    /// [`MIN_CENTROID_VALUES_FOR_INDEX`] the route is flat either way, and this
+    /// is then the only field that tells the arms of an A/B run apart.
+    amx_blocker: Option<&'static str>,
+}
+
+/// Decides an [`AssignmentRoute`].
+///
+/// A separate function from [`SimpleIndex::may_train_index`] because what the
+/// log *says* is worth asserting, and asserting it here needs no global logger
+/// installed.
+fn assignment_route(
+    centroid_type: &DataType,
+    num_centroids: usize,
+    dimension: usize,
+    distance_type: DistanceType,
+    amx: AmxAvailability,
+    status: &SimpleIndexStatus,
+) -> AssignmentRoute {
+    let amx_blocker =
+        flat_amx_assignment_blocker(centroid_type, num_centroids, dimension, distance_type, amx);
+    // Declining to build an index is not one outcome but two, and they perform
+    // very differently, so the flat routes are named apart.
+    let flat_route = if amx_blocker.is_none() {
+        "flat+amx"
+    } else {
+        "flat"
+    };
+    let (train_index, route, reason) = match status {
+        SimpleIndexStatus::Enabled => (true, "hnsw", "LANCE_USE_HNSW_SPEEDUP_INDEXING=enabled"),
+        SimpleIndexStatus::Disabled => (
+            false,
+            flat_route,
+            "LANCE_USE_HNSW_SPEEDUP_INDEXING=disabled",
+        ),
+        // Too few centroid values for the index to pay for itself, so assignment
+        // stays flat whatever the GEMM can do for it. This is the branch every
+        // small shape takes -- including 100 x 1536, where the gate below never
+        // decides anything -- so without a reason of its own those builds would
+        // log nothing at all.
+        SimpleIndexStatus::Auto
+            if num_centroids.saturating_mul(dimension) < MIN_CENTROID_VALUES_FOR_INDEX =>
+        {
+            (
+                false,
+                flat_route,
+                "the centroid set is below the size an approximate index pays for",
+            )
+        }
+        SimpleIndexStatus::Auto => match amx_blocker {
+            Some(blocker) => (true, "hnsw", blocker),
+            None => (
+                false,
+                flat_route,
+                "the exact flat scan beats an approximate lookup on this shape",
+            ),
+        },
+    };
+    AssignmentRoute {
+        train_index,
+        route,
+        reason,
+        amx_blocker,
+    }
 }
 
 #[derive(Debug)]
@@ -118,31 +280,45 @@ impl SimpleIndex {
     // train HNSW over the centroids to speed up finding the nearest clusters,
     // only train if all conditions are met:
     //  - the centroids are float16/float32 or uint8 with hamming distance
-    //  - `num_centroids * dimension >= 1_000_000`
-    //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
-    //      so set the threshold to 1_000_000.
-    //  - the exact flat assignment is not already faster, see `prefers_flat_amx_assignment`
+    //  - `num_centroids * dimension >= MIN_CENTROID_VALUES_FOR_INDEX`
+    //  - the exact flat assignment is not already faster, see
+    //    `flat_amx_assignment_blocker`
     pub fn may_train_index(
         centroids: ArrayRef,
         dimension: usize,
         distance_type: DistanceType,
     ) -> Result<Option<Self>> {
-        match *USE_HNSW_SPEEDUP_INDEXING {
-            SimpleIndexStatus::Auto => {
-                if centroids.len() < 1_000_000 {
-                    return Ok(None);
-                }
-                if prefers_flat_amx_assignment(
-                    centroids.data_type(),
-                    centroids.len() / dimension,
-                    dimension,
-                    distance_type,
-                ) {
-                    return Ok(None);
-                }
-            }
-            SimpleIndexStatus::Disabled => return Ok(None),
-            _ => {}
+        // Guarded rather than divided by: every branch below needs the centroid
+        // count, and a zero-width vector has none to index. Declining leaves the
+        // caller on the flat path, which reports the malformed shape properly;
+        // dividing here would panic before it got the chance.
+        let Some(num_centroids) = centroids.len().checked_div(dimension) else {
+            warn!("IVF partition assignment: no centroid index for a zero dimension");
+            return Ok(None);
+        };
+        let decision = assignment_route(
+            centroids.data_type(),
+            num_centroids,
+            dimension,
+            distance_type,
+            AmxAvailability::current(),
+            &USE_HNSW_SPEEDUP_INDEXING,
+        );
+        // Once per k-means training call -- a few dozen lines over a build, since
+        // hierarchical k-means retrains per level. That is the right granularity
+        // for `debug!`: the matching gate in `compute_membership_and_dist` runs
+        // per block of vectors, where the same line would flood.
+        debug!(
+            "IVF partition assignment: route={}, centroid_type={}, \
+             num_centroids={num_centroids}, dimension={dimension}, \
+             distance_type={distance_type}, amx={}, reason={}",
+            decision.route,
+            centroids.data_type(),
+            decision.amx_blocker.unwrap_or("in use"),
+            decision.reason,
+        );
+        if !decision.train_index {
+            return Ok(None);
         }
 
         let store = match (centroids.data_type(), distance_type) {
@@ -465,37 +641,246 @@ mod tests {
 
     /// Every shape the AMX-FP16 GEMM cannot serve must keep the centroid index,
     /// because without the GEMM the flat path it would fall back to is ~2.7x
-    /// slower than the index. These four are the exact complement of the gate in
+    /// slower than the index. These are the exact complement of the gate in
     /// `compute_membership_and_dist`.
+    ///
+    /// The reported reason is asserted too, not just that there was one: it is
+    /// the only signal an A/B run has for which path a build took, so a reason
+    /// that names the wrong condition is as bad as no reason at all.
     #[rstest]
-    #[case::not_f16(&DataType::Float32, 10_000, 768, DistanceType::Dot)]
-    #[case::not_dot(&DataType::Float16, 10_000, 768, DistanceType::L2)]
-    #[case::dim_below_one_k_pass(&DataType::Float16, 10_000, 31, DistanceType::Dot)]
-    #[case::k_below_one_b_block(&DataType::Float16, 31, 768, DistanceType::Dot)]
+    #[case::not_a_float_the_kernel_takes(&DataType::Float64, 10_000, 768, DistanceType::Dot, "centroid type")]
+    #[case::not_dot(&DataType::Float16, 10_000, 768, DistanceType::L2, "distance type")]
+    #[case::not_dot_f32(&DataType::Float32, 10_000, 768, DistanceType::L2, "distance type")]
+    #[case::dim_below_one_k_pass(&DataType::Float16, 10_000, 31, DistanceType::Dot, "dimension")]
+    #[case::k_below_one_b_block(&DataType::Float16, 31, 768, DistanceType::Dot, "centroid count")]
+    #[case::dim_below_one_k_pass_f32(&DataType::Float32, 10_000, 31, DistanceType::Dot, "dimension")]
+    #[case::k_below_one_b_block_f32(&DataType::Float32, 31, 768, DistanceType::Dot, "centroid count")]
     fn test_flat_amx_assignment_declines_unsupported_shapes(
         #[case] centroid_type: &DataType,
         #[case] num_centroids: usize,
         #[case] dimension: usize,
         #[case] distance_type: DistanceType,
+        #[case] expected_reason: &str,
     ) {
-        assert!(!prefers_flat_amx_assignment(
+        // Every route in service, so the shape is the only thing left to decline
+        // on. Availability is a parameter precisely so this holds on any host.
+        let blocker = flat_amx_assignment_blocker(
             centroid_type,
             num_centroids,
             dimension,
-            distance_type
-        ));
+            distance_type,
+            ALL_ROUTES,
+        )
+        .expect("this shape must be declined");
+        assert!(
+            blocker.contains(expected_reason),
+            "blocked for {blocker:?}, expected something about {expected_reason:?}"
+        );
     }
 
-    /// On a supported shape the decision is exactly "is AMX-FP16 usable here",
-    /// which is a property of the build, the CPU and the `LANCE_DISABLE_AMX`
-    /// kill switch, so the expectation is derived rather than hardcoded -- the
-    /// same assertion has to hold with the switch set, on a machine without AMX,
-    /// and in a build whose toolchain could not compile the kernel.
+    /// Both routes in service — the state a Granite Rapids host with neither
+    /// kill switch set is in, and the one where only the *shape* can decline.
+    const ALL_ROUTES: AmxAvailability = AmxAvailability {
+        native: true,
+        rounded: true,
+    };
+
+    /// The blocker's dependence on the two switches, enumerated.
+    ///
+    /// Availability is a parameter rather than a read of the environment so this
+    /// can be a table. Derived from `amx_fp32_cast_available()` instead, the fp32
+    /// row would assert that a function returns what the very call it makes
+    /// returns — true even if fp32 were wired to the f16 switch, which is the
+    /// mistake that would send an `LANCE_AMX_FP32_CAST=0` build down the exact
+    /// path with no GEMM under it.
+    #[rstest]
+    #[case::everything_on(true, true, None, None)]
+    #[case::cast_off(true, false, None, Some("LANCE_AMX_FP32_CAST is off"))]
+    #[case::amx_off(
+        false,
+        false,
+        Some("AMX-FP16 is unavailable"),
+        Some("AMX-FP16 is unavailable")
+    )]
+    fn test_flat_amx_assignment_follows_amx_availability(
+        #[case] native: bool,
+        #[case] rounded: bool,
+        #[case] f16_blocker: Option<&str>,
+        #[case] f32_blocker: Option<&str>,
+    ) {
+        let amx = AmxAvailability { native, rounded };
+        for (centroid_type, want) in [
+            (&DataType::Float16, f16_blocker),
+            (&DataType::Float32, f32_blocker),
+        ] {
+            let got =
+                flat_amx_assignment_blocker(centroid_type, 10_000, 768, DistanceType::Dot, amx);
+            match want {
+                None => assert_eq!(got, None, "{centroid_type} with {amx:?}"),
+                Some(want) => assert!(
+                    got.is_some_and(|reason| reason.contains(want)),
+                    "{centroid_type} with {amx:?}: blocked for {got:?}, expected {want:?}"
+                ),
+            }
+        }
+    }
+
+    /// Production reads the switches through exactly one function, and this is
+    /// the assertion that it is still the right one. Derived rather than
+    /// enumerated because that is all a `LazyLock`-cached switch permits — the
+    /// table above is where the routing itself is pinned.
     #[test]
-    fn test_flat_amx_assignment_follows_amx_availability() {
-        assert_eq!(
-            prefers_flat_amx_assignment(&DataType::Float16, 10_000, 768, DistanceType::Dot),
-            amx_fp16_available()
+    fn test_amx_availability_reads_both_switches() {
+        let current = AmxAvailability::current();
+        assert_eq!(current.native, amx_fp16_available());
+        assert_eq!(current.rounded, amx_fp32_cast_available());
+    }
+
+    /// What the `debug!` line reports, over the routes it has to keep apart —
+    /// including the one an fp32 A/B run switches between.
+    ///
+    /// That line is the only signal separating the two arms: the k-means loss is
+    /// expected to be identical to four decimal places with the cast on and off,
+    /// which is the result the cast exists to produce, so the loss cannot
+    /// confirm which path a build took. If the line ever reported the same route
+    /// for both arms, an A/B run would silently compare a path against itself.
+    ///
+    /// Availability is enumerated, not read from the process. With the cast off,
+    /// an exact-capable shape stops being exact-capable — so `train_index` flips
+    /// to `true` and the route to `hnsw`. Hardcoding "must not build an index"
+    /// here is what made the `LANCE_AMX_FP32_CAST=0` and `LANCE_DISABLE_AMX=1`
+    /// runs of this suite fail, and would fail CI on any host without AMX.
+    #[rstest]
+    #[case::big_f16_auto(&DataType::Float16, 10_000, 768, SimpleIndexStatus::Auto, false)]
+    #[case::big_f32_auto(&DataType::Float32, 10_000, 768, SimpleIndexStatus::Auto, false)]
+    #[case::small_f32_auto(&DataType::Float32, 100, 1536, SimpleIndexStatus::Auto, true)]
+    #[case::big_f16_disabled(&DataType::Float16, 10_000, 768, SimpleIndexStatus::Disabled, false)]
+    fn test_assignment_route_names_the_path_with_amx(
+        #[case] centroid_type: &DataType,
+        #[case] num_centroids: usize,
+        #[case] dimension: usize,
+        #[case] status: SimpleIndexStatus,
+        #[case] below_index_threshold: bool,
+    ) {
+        for amx in [
+            ALL_ROUTES,
+            AmxAvailability {
+                native: true,
+                rounded: false,
+            },
+            AmxAvailability {
+                native: false,
+                rounded: false,
+            },
+        ] {
+            let decision = assignment_route(
+                centroid_type,
+                num_centroids,
+                dimension,
+                DistanceType::Dot,
+                amx,
+                &status,
+            );
+            let usable = flat_amx_assignment_blocker(
+                centroid_type,
+                num_centroids,
+                dimension,
+                DistanceType::Dot,
+                amx,
+            )
+            .is_none();
+            let context = format!("{centroid_type} with {amx:?}");
+            // An index is built exactly when the GEMM cannot serve the shape and
+            // nothing has already settled the question -- below the index
+            // threshold, or with the index switched off, assignment stays flat
+            // however unusable the GEMM is.
+            let decided_elsewhere =
+                below_index_threshold || matches!(status, SimpleIndexStatus::Disabled);
+            let train_index = !usable && !decided_elsewhere;
+
+            assert_eq!(decision.amx_blocker.is_none(), usable, "{context}");
+            assert_eq!(
+                decision.train_index, train_index,
+                "{context}: route={} reason={}",
+                decision.route, decision.reason
+            );
+            assert_eq!(
+                decision.route,
+                match (train_index, usable) {
+                    (true, _) => "hnsw",
+                    (false, true) => "flat+amx",
+                    (false, false) => "flat",
+                },
+                "{context}"
+            );
+            if !train_index {
+                assert_eq!(
+                    below_index_threshold,
+                    decision.reason.contains("below the size"),
+                    "{context}: reason={}",
+                    decision.reason
+                );
+            }
+        }
+    }
+
+    /// A shape the GEMM cannot serve keeps the approximate index, and the line
+    /// has to name the condition that sent it there rather than just "hnsw".
+    #[test]
+    fn test_assignment_route_reports_why_it_went_approximate() {
+        let decision = assignment_route(
+            &DataType::Float16,
+            10_000,
+            768,
+            DistanceType::L2,
+            ALL_ROUTES,
+            &SimpleIndexStatus::Auto,
         );
+        assert!(decision.train_index);
+        assert_eq!(decision.route, "hnsw");
+        assert!(
+            decision.reason.contains("distance type"),
+            "reason={}",
+            decision.reason
+        );
+        assert_eq!(decision.amx_blocker, Some(decision.reason));
+    }
+
+    /// Below the index threshold the route is flat either way, so `reason` says
+    /// the same thing with the cast on and off. `amx_blocker` is then the only
+    /// field that separates the two arms of an fp32 A/B run — the case this
+    /// pins, and the shape (100 x 1536) a first local run actually has.
+    #[test]
+    fn test_assignment_route_reports_the_amx_blocker_on_a_small_centroid_set() {
+        let cast_off = AmxAvailability {
+            native: true,
+            rounded: false,
+        };
+        let on = assignment_route(
+            &DataType::Float32,
+            100,
+            1536,
+            DistanceType::Dot,
+            ALL_ROUTES,
+            &SimpleIndexStatus::Auto,
+        );
+        let off = assignment_route(
+            &DataType::Float32,
+            100,
+            1536,
+            DistanceType::Dot,
+            cast_off,
+            &SimpleIndexStatus::Auto,
+        );
+
+        assert!(!on.train_index && !off.train_index);
+        assert_eq!(
+            on.reason, off.reason,
+            "the threshold reason cannot tell the arms apart -- that is the point"
+        );
+        assert_eq!(on.route, "flat+amx");
+        assert_eq!(off.route, "flat");
+        assert_eq!(on.amx_blocker, None);
+        assert_eq!(off.amx_blocker, Some("LANCE_AMX_FP32_CAST is off"));
     }
 }

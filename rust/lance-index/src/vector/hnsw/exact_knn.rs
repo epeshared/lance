@@ -678,8 +678,21 @@ mod tests {
     /// it, and runs only on a host that grants XTILEDATA, so every test that
     /// needs a real result returns early elsewhere. Skipping is the same
     /// convention the flat storage's AMX test uses.
+    /// Whether `exact_knn_topk` will find a kernel, which is what
+    /// `PackedCentroidsF16::new` asks — hardware support alone.
+    ///
+    /// Deliberately *not* `amx_fp16_available()`: that adds the
+    /// `LANCE_DISABLE_AMX` kill switch, which this path does not consult, so
+    /// under `LANCE_DISABLE_AMX=1` the tests below would demand a `NotSupported`
+    /// error from a call that still succeeds.
+    ///
+    /// TODO: decide whether that is the intended behaviour. The switch is
+    /// documented as taking the AMX paths out of service, and partition
+    /// assignment honours it; exact-KNN graph building not honouring it means an
+    /// operator cannot A/B this path or fall back without a rebuild. Changing it
+    /// is a behaviour change and belongs in its own PR.
     fn amx_ready() -> bool {
-        lance_linalg::distance::dot_f16::amx_fp16_available()
+        lance_linalg::distance::dot_f16::amx_fp16_supported()
     }
 
     /// `n` deterministic pseudo-random unit vectors, row-major.

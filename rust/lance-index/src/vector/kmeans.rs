@@ -31,9 +31,10 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::dot_f16::{
     PackedCentroidsF16, amx_fp16_available, amx_fp16_supported, dot_f16_batch_16,
+    f32_to_f16_checked,
 };
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
-use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
+use lance_linalg::distance::{DistanceType, Normalize, dot_distance, dot_distance_batch};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
 use log::{info, warn};
 use num_traits::One;
@@ -48,7 +49,7 @@ use {
     lance_linalg::kernels::argmin_value,
 };
 
-use crate::vector::utils::SimpleIndex;
+use crate::vector::utils::{AmxAvailability, SimpleIndex};
 use lance_core::{Error, Result};
 
 /// KMean initialization method.
@@ -328,51 +329,209 @@ pub trait KMeansAlgo<T: Num> {
     ) -> KMeans;
 }
 
-/// Reads a `T::Native` slice as `f16` when — and only when — that is what it is.
+/// How an element type reaches the AMX-FP16 GEMM, if it can at all.
 ///
-/// The default body answers `None`, so every element type opts out until it
-/// says otherwise, and [`Float16Type`] is the one that overrides it with the
-/// identity. That keeps "is this f16?" a compile-time property of `T` for the
-/// dot-distance kernel below, rather than a `DataType` comparison paired with a
-/// transmute whose correctness the compiler cannot check.
+/// Every member defaults to "it cannot", so a type opts out until it says
+/// otherwise. That keeps the whole question a compile-time property of `T` for
+/// the dot-distance kernel below, rather than a `DataType` comparison paired
+/// with a transmute whose correctness the compiler cannot check.
+///
+/// Two element types reach it, by different routes:
+///
+/// - [`Float16Type`] is already what the kernel reads, so [`as_f16_slice`] hands
+///   its rows over with no copy at all.
+/// - [`Float32Type`] is rounded first, by [`to_f16_into`], which is why that
+///   method reports whether the rounding survived rather than returning `()`.
+///
+/// [`as_f16_slice`]: MaybeF16::as_f16_slice
+/// [`to_f16_into`]: MaybeF16::to_f16_into
 pub(crate) trait MaybeF16: ArrowNumericType {
+    /// Whether the AMX-FP16 GEMM can take this element type at all — by either
+    /// route. A pure property of the type, so callers can decline before
+    /// touching any data; it says nothing about the host or the kill switches.
+    const AMX_F16_CAPABLE: bool = false;
+
+    /// Reads a `T::Native` slice as `f16` when — and only when — that is what
+    /// it is. `Some` is the zero-copy route into the kernel; `None` means the
+    /// caller must round through [`to_f16_into`](Self::to_f16_into) instead.
     fn as_f16_slice(_values: &[Self::Native]) -> Option<&[f16]> {
+        None
+    }
+
+    /// Rounds `src` into `dst`, element for element.
+    ///
+    /// `false` when this element type has no defined f16 rounding at all, or
+    /// when the rounding produced a non-finite value — an overflow (a perfectly
+    /// finite `1e5` becomes an f16 infinity), or a non-finite input carried
+    /// through. The caller must then run its own path over `src`: the tile
+    /// instruction accumulates `out[m][n] += Σ_k A[m][k]·B[k][n]`, so a spoiled
+    /// row of `A` ruins that row's scores and no other — but a `bool` cannot say
+    /// *which* row, which is the price of rounding without a per-element branch.
+    fn to_f16_into(_src: &[Self::Native], _dst: &mut [f16]) -> bool {
+        false
+    }
+
+    /// Packs `n` row-major `dim`-dimensional centroids of this element type
+    /// into the GEMM's B operand, taking whichever route the type has.
+    ///
+    /// `None` carries every reason [`PackedCentroidsF16::new`] returns it, plus
+    /// -- on the rounding route -- a centroid the rounding could not represent.
+    fn pack_centroids(
+        _centroids: &[Self::Native],
+        _n: usize,
+        _dim: usize,
+    ) -> Option<PackedCentroidsF16> {
         None
     }
 }
 
 impl MaybeF16 for Float16Type {
+    const AMX_F16_CAPABLE: bool = true;
+
     fn as_f16_slice(values: &[f16]) -> Option<&[f16]> {
         Some(values)
     }
+
+    fn to_f16_into(src: &[f16], dst: &mut [f16]) -> bool {
+        dst.copy_from_slice(src);
+        true
+    }
+
+    fn pack_centroids(centroids: &[f16], n: usize, dim: usize) -> Option<PackedCentroidsF16> {
+        PackedCentroidsF16::new(centroids, n, dim)
+    }
 }
-impl MaybeF16 for Float32Type {}
+
+impl MaybeF16 for Float32Type {
+    const AMX_F16_CAPABLE: bool = true;
+
+    fn to_f16_into(src: &[f32], dst: &mut [f16]) -> bool {
+        f32_to_f16_checked(src, dst)
+    }
+
+    fn pack_centroids(centroids: &[f32], n: usize, dim: usize) -> Option<PackedCentroidsF16> {
+        PackedCentroidsF16::from_f32(centroids, n, dim)
+    }
+}
+
 impl MaybeF16 for Float64Type {}
 
-/// Per-thread score-buffer budget for [`dot_membership_amx_f16`], in f32
-/// values: 256 KB, sized to stay within a typical private L2 alongside the
-/// vectors and packed centroids a block streams past.
+/// Per-thread score-buffer budget for [`dot_membership_amx`], in f32 values:
+/// 256 KB, sized to stay within a typical private L2 alongside the vectors and
+/// packed centroids a block streams past.
 const AMX_DOT_SCRATCH_F32: usize = 64 * 1024;
+
+/// How many rows [`dot_membership_amx`] hands the kernel per block: as many as
+/// [`AMX_DOT_SCRATCH_F32`] buys, rounded down to the kernel's 32-row
+/// granularity, and capped so a large input still splits into enough blocks to
+/// spread across threads. Very large `k` blows the budget on a single row, hence
+/// the lower clamp back to one tile pass.
+///
+/// A function rather than an expression inline so tests can name the block
+/// boundary a fallback lands on without restating the formula.
+fn amx_block_rows(n_padded: usize) -> usize {
+    ((AMX_DOT_SCRATCH_F32 / n_padded) & !31).clamp(32, 512)
+}
+
+/// Whether dot-distance assignment for `T` should be routed onto the AMX-FP16
+/// GEMM, given which routes onto the kernel are in service.
+///
+/// The switches are consulted here rather than inside [`dot_membership_amx`]:
+/// this is the one place production work is routed onto the kernel, so the
+/// accelerated path stays directly testable, while
+/// `flat_amx_assignment_blocker` — which has to stay in lockstep with this
+/// decision — takes its answer from the same [`AmxAvailability`].
+///
+/// `amx` is a parameter and not a read of the environment so this table can be
+/// tested by enumeration; see [`AmxAvailability`].
+fn amx_dot_routing_available<T: MaybeF16>(data: &[T::Native], amx: AmxAvailability) -> bool {
+    T::AMX_F16_CAPABLE
+        && match T::as_f16_slice(data) {
+            // f16 rows reach the kernel untouched.
+            Some(_) => amx.native,
+            // Everything else is rounded to f16 first, which is a change in what
+            // gets computed and so has a switch of its own.
+            None => amx.rounded,
+        }
+}
 
 /// Assigns each row of `data` (row-major `[_, dimension]`) to its nearest
 /// centroid under dot distance using the AMX-FP16 GEMM, scoring 32 vectors
 /// against every centroid per tile pass instead of one vector at a time.
 ///
-/// `None` — the kernel is unavailable on this build or host, or the shape does
-/// not suit it — means the caller must run its own per-vector path. The output
-/// is otherwise identical in content and order to that path: `(centroid,
-/// distance)` per row, `None` for a row whose distances are all NaN.
+/// `None` — this element type cannot reach the kernel, the kernel is
+/// unavailable on this build or host, or the shape does not suit it — means the
+/// caller must run its own per-vector path. The output is otherwise identical in
+/// content and order to that path: `(centroid, distance)` per row, `None` for a
+/// row whose distances are all NaN.
 ///
-/// Answers only "can this shape run here": the `LANCE_DISABLE_AMX` kill switch
-/// is checked by the caller, so the accelerated path stays directly testable
-/// while production traffic honours an operator who turned it off.
-fn dot_membership_amx_f16(
-    centroids: &[f16],
-    data: &[f16],
+/// Answers only "can this run here": both kill switches are checked by the
+/// caller (see [`amx_dot_routing_available`]), so this stays directly testable
+/// while production traffic honours an operator who turned them off.
+///
+/// # f16 rows go in as they are, anything else is rounded per block
+///
+/// The kernel reads f16 only, so an fp32 column has to be rounded on the way in,
+/// one block at a time into thread-private scratch. What that costs is a
+/// question about *time*, not about element counts, and the answer depends on
+/// `k` alone:
+///
+/// - rounding a row is `dim` elements at 0.094 ns each (measured; see
+///   `f32_to_f16_conversion_bench` in lance-linalg);
+/// - the GEMM for that row is `dim * n_padded` multiply-accumulates, and the
+///   tile unit retires 512 of them per cycle.
+///
+/// `dim` cancels, and so does the block height — the ratio is
+/// `0.094ns * 512 * clock / n_padded`, i.e. **roughly `125 / k`**:
+///
+/// | dim  | k     | rounding | GEMM     | rounding is |
+/// |------|-------|----------|----------|-------------|
+/// | 768  | 10000 | 2.3 µs   | 200 µs   | ~1%         |
+/// | 1536 | 2048  | 4.6 µs   | 82 µs    | ~6%         |
+/// | 768  | 100   | 37 µs    | 41 µs    | ~90%        |
+///
+/// So the "rounding is free" reading only holds at the `k` an IVF index of any
+/// size actually uses (`k ≈ sqrt(rows)`, so thousands). At small `k` rounding is
+/// the same order as the GEMM — but that is still not a reason to decline,
+/// because the alternative is not "GEMM without rounding", it is the per-vector
+/// scalar path, which is slower than both put together. It *is* the reason the
+/// rounding had to stop being a per-element function call: see
+/// [`f32_to_f16_checked`], where hoisting the F16C probe out of the loop bought
+/// 9.4x and moved the `k = 100` row of that table from 870% to 90%.
+///
+/// Rounding per block rather than once for the column keeps the scratch inside
+/// L2 and avoids an f16 copy of the whole input.
+///
+/// An f16 column pays none of this: [`MaybeF16::as_f16_slice`] hands the block
+/// straight to the kernel with no copy and no scratch allocation, so f16
+/// behaviour is bit-for-bit what it was before fp32 was served here.
+///
+/// # The reported distance is recomputed in the input type
+///
+/// For a rounded column the GEMM's own score is an f16-precision answer, and the
+/// distances returned here feed k-means' loss — the one number that says whether
+/// rounding hurt the clustering. A loss computed from f16 scores cannot be
+/// compared against the exact path's, so the winner is *chosen* from the GEMM
+/// and its distance is then recomputed from the original `T::Native` rows and
+/// centroids. That is one `dim`-long dot product per vector against the GEMM's
+/// `k` of them, so it scales as `1/k` — the same shape as the rounding above,
+/// and negligible wherever the rounding is.
+///
+/// f16 columns keep reporting the GEMM's score, which for them is already the
+/// exact answer for the row the kernel read.
+fn dot_membership_amx<T: MaybeF16>(
+    centroids: &[T::Native],
+    data: &[T::Native],
     dimension: usize,
     balance_factor: f32,
     cluster_sizes: Option<&[usize]>,
-) -> Option<Vec<Option<(u32, f32)>>> {
+) -> Option<Vec<Option<(u32, f32)>>>
+where
+    T::Native: Dot + Sync,
+{
+    if !T::AMX_F16_CAPABLE {
+        return None;
+    }
     let k = centroids.len() / dimension;
     // Under one full 32-wide k-pass the GEMM degenerates to the kernel's scalar
     // cleanup, and under one full 32-centroid block most of its work would be
@@ -380,13 +539,29 @@ fn dot_membership_amx_f16(
     if dimension < 32 || k < 32 {
         return None;
     }
-    let packed = PackedCentroidsF16::new(centroids, k, dimension)?;
+    let Some(packed) = T::pack_centroids(centroids, k, dimension) else {
+        if amx_fp16_supported() {
+            // The host can run the kernel, the shape suits it, and the gate has
+            // already decided against building the centroid index on that basis
+            // -- so this is the one combination nothing else can catch: the
+            // exact path with no GEMM under it, ~2.7x slower than either
+            // alternative. Only a centroid the rounding cannot represent gets
+            // here, which is a property of the data and cannot be checked before
+            // the run, so the operator has to hear about it from the run.
+            warn!(
+                "IVF partition assignment is falling back to the per-vector path: {k} centroids \
+                 of {dimension} dims hold a value that cannot be represented in f16, so the \
+                 AMX-FP16 GEMM cannot be used for this training round"
+            );
+        }
+        return None;
+    };
     let n_padded = packed.num_centroids_padded();
-    // Rows per block: as many as the scratch budget buys, rounded down to the
-    // kernel's 32-row granularity, and capped so a large input still splits
-    // into enough blocks to spread across threads. Very large `k` blows the
-    // budget on a single row, hence the lower clamp back to one tile pass.
-    let block_rows = ((AMX_DOT_SCRATCH_F32 / n_padded) & !31).clamp(32, 512);
+    let block_rows = amx_block_rows(n_padded);
+    // A compile-time constant once monomorphized: it decides both whether a
+    // rounding buffer is allocated at all and whether the reported distance is
+    // recomputed, and neither may cost the f16 path anything.
+    let has_native_f16_rows = T::as_f16_slice(data).is_some();
     // Precomputed once, not per row. The bias depends only on the centroid, so
     // rebuilding it inside the loop would repeat `k` multiplications for every
     // one of the `n` vectors -- `n * k` of them across the call, against `k` here.
@@ -397,35 +572,82 @@ fn dot_membership_amx_f16(
             .collect()
     });
     let biases = || biases.as_deref().map(|b| b.iter().copied());
+    let per_vector = |vector: &[T::Native]| {
+        argmin_value_float_with_bias(dot_distance_batch(vector, centroids, dimension), biases())
+    };
 
     Some(
         data.par_chunks(block_rows * dimension)
             .map_init(
-                || vec![0f32; block_rows * n_padded],
-                |scores, block| {
+                || {
+                    (
+                        vec![0f32; block_rows * n_padded],
+                        // Not allocated at all on the f16 path, which never
+                        // reads it.
+                        vec![
+                            f16::ZERO;
+                            if has_native_f16_rows {
+                                0
+                            } else {
+                                block_rows * dimension
+                            }
+                        ],
+                    )
+                },
+                |(scores, rounded), block| {
                     let rows = block.len() / dimension;
                     let tiled = rows - rows % 32;
+                    let tiled_len = tiled * dimension;
                     let mut assignments = Vec::with_capacity(rows);
 
-                    packed.score(block, tiled, dimension, scores, n_padded);
-                    for row in 0..tiled {
-                        // Only the first `k` columns. The rest score the zero
-                        // centroids padding `n` up to the kernel's block size,
-                        // at distance exactly 1.0 — which beats every real
-                        // centroid whose dot product happens to be negative.
-                        let dots = &scores[row * n_padded..row * n_padded + k];
-                        assignments.push(argmin_value_float_with_bias(
-                            dots.iter().map(|dot| 1.0 - dot),
-                            biases(),
-                        ));
+                    // The f16 view of the rows a tile pass will read. `None`
+                    // means the rounding met a value f16 cannot hold. Only the
+                    // row holding it would be spoiled, but `to_f16_into` reports
+                    // one bool for the block, so the block is what falls back --
+                    // bit-exact with the per-vector path, since it *is* that
+                    // path. See `MaybeF16::to_f16_into` for why it is a bool.
+                    let tiled_f16 = match T::as_f16_slice(block) {
+                        Some(rows_f16) => Some(&rows_f16[..tiled_len]),
+                        None => {
+                            let rounded_ok =
+                                T::to_f16_into(&block[..tiled_len], &mut rounded[..tiled_len]);
+                            rounded_ok.then_some(&rounded[..tiled_len])
+                        }
+                    };
+                    match tiled_f16 {
+                        Some(tiled_f16) => {
+                            packed.score(tiled_f16, tiled, dimension, scores, n_padded);
+                            for row in 0..tiled {
+                                // Only the first `k` columns. The rest score the
+                                // zero centroids padding `n` up to the kernel's
+                                // block size, at distance exactly 1.0 — which
+                                // beats every real centroid whose dot product
+                                // happens to be negative.
+                                let dots = &scores[row * n_padded..row * n_padded + k];
+                                let picked = argmin_value_float_with_bias(
+                                    dots.iter().map(|dot| 1.0 - dot),
+                                    biases(),
+                                );
+                                assignments.push(match picked {
+                                    // `argmin_value_float_with_bias` reports the
+                                    // distance without the balance bias, so the
+                                    // replacement must be the unbiased distance
+                                    // too.
+                                    Some((id, _)) if !has_native_f16_rows => {
+                                        let vector = &block[row * dimension..(row + 1) * dimension];
+                                        let centroid = &centroids[id as usize * dimension
+                                            ..(id as usize + 1) * dimension];
+                                        Some((id, dot_distance(vector, centroid)))
+                                    }
+                                    picked => picked,
+                                });
+                            }
+                        }
+                        None => assignments
+                            .extend(block[..tiled_len].chunks(dimension).map(&per_vector)),
                     }
                     // Rows past the last whole tile pass keep the per-vector path.
-                    for vector in block[tiled * dimension..].chunks(dimension) {
-                        assignments.push(argmin_value_float_with_bias(
-                            dot_distance_batch(vector, centroids, dimension),
-                            biases(),
-                        ));
-                    }
+                    assignments.extend(block[tiled_len..].chunks(dimension).map(&per_vector));
                     assignments
                 },
             )
@@ -478,34 +700,31 @@ where
                         )
                     })
                     .collect::<Vec<_>>(),
-                DistanceType::Dot => T::as_f16_slice(centroids)
-                    .zip(T::as_f16_slice(data))
-                    // The kill switch is enforced here rather than inside the
-                    // kernel wrapper: this is the one place production work is
-                    // routed onto the GEMM, and `prefers_flat_amx_assignment`
-                    // reads the same flag, so the two stay in lockstep.
-                    .filter(|_| amx_fp16_available())
-                    .and_then(|(centroids, data)| {
-                        dot_membership_amx_f16(
-                            centroids,
-                            data,
-                            dimension,
-                            balance_factor,
-                            cluster_sizes,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        data.par_chunks(dimension)
-                            .map(|vec| {
-                                argmin_value_float_with_bias(
-                                    dot_distance_batch(vec, centroids, dimension),
-                                    cluster_sizes.map(|size| {
-                                        size.iter().map(|size| balance_factor * *size as f32)
-                                    }),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    }),
+                DistanceType::Dot => {
+                    amx_dot_routing_available::<T>(data, AmxAvailability::current())
+                        .then(|| {
+                            dot_membership_amx::<T>(
+                                centroids,
+                                data,
+                                dimension,
+                                balance_factor,
+                                cluster_sizes,
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            data.par_chunks(dimension)
+                                .map(|vec| {
+                                    argmin_value_float_with_bias(
+                                        dot_distance_batch(vec, centroids, dimension),
+                                        cluster_sizes.map(|size| {
+                                            size.iter().map(|size| balance_factor * *size as f32)
+                                        }),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                }
                 _ => {
                     panic!(
                         "KMeans::find_partitions: {} is not supported",
@@ -1758,6 +1977,8 @@ mod tests {
     use lance_linalg::distance::dot_f16::amx_fp16_supported;
     use lance_linalg::distance::l2;
     use lance_linalg::kernels::argmin;
+    use rayon::ThreadPoolBuilder;
+    use rstest::rstest;
 
     /// The AMX partition path must pick the same partitions as the scalar one.
     /// Exact equality on the distances is not required -- the kernel accumulates
@@ -2021,32 +2242,84 @@ mod tests {
     /// disagree — that is fp16 arithmetic, not a bug.
     const AMX_TIE_GAP: f32 = 1e-2;
 
+    /// The same idea for a column that had to be *rounded* to f16, where the
+    /// scores move by much more than summation order alone. f16's relative step
+    /// is 2^-11, and `dim` random terms of magnitude ~1 accumulate to roughly
+    /// `sqrt(dim) * 2^-11` of perturbation — about 0.014 at `dim = 768`. `0.1`
+    /// sits well clear of that at every dimension exercised here. How often a
+    /// closer pair actually changes hands, and what it costs, is pinned by
+    /// [`test_dot_amx_f32_matches_the_exact_path`] rather than waved through.
+    const F32_CAST_TIE_GAP: f32 = 0.1;
+
+    /// How far a *rounded* column's reported distance may sit from the
+    /// per-vector path's. It is recomputed from the original fp32 values, so the
+    /// only difference left is f32 summation order — two orders of magnitude
+    /// tighter than [`AMX_REL_TOL`], and deliberately so: this bound is what
+    /// fails if the recomputation is ever dropped and the fp16 score reported
+    /// instead. `test_dot_amx_f32_reports_the_exact_f32_distance` pins that the
+    /// gap really is discriminating rather than merely satisfied.
+    const EXACT_REL_TOL: f32 = 1e-5;
+
     fn random_f16(count: usize, rng: &mut SmallRng) -> Vec<f16> {
         (0..count)
             .map(|_| f16::from_f32(rng.random_range(-1.0f32..1.0)))
             .collect()
     }
 
+    /// fp32 values that are deliberately *not* f16-representable, so rounding
+    /// them is lossy and the fp32 path is actually exercised rather than
+    /// accidentally exact.
+    fn random_f32(count: usize, rng: &mut SmallRng) -> Vec<f32> {
+        (0..count).map(|_| rng.random_range(-1.0f32..1.0)).collect()
+    }
+
+    /// `rows` unit-length fp32 vectors of `dimension`.
+    ///
+    /// Dot distance is only meaningful on vectors of comparable length, so this
+    /// is the scale the path actually runs at: distances land in `[0, 2]`, which
+    /// is what makes an absolute tolerance on a distance mean anything.
+    fn random_unit_f32(rows: usize, dimension: usize, rng: &mut SmallRng) -> Vec<f32> {
+        let mut values = random_f32(rows * dimension, rng);
+        for row in values.chunks_mut(dimension) {
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|v| *v /= norm);
+        }
+        values
+    }
+
     /// Assert the AMX dot path engages for this input and assigns every vector
     /// where the per-vector path does.
-    fn assert_dot_paths_agree(
-        centroids: &[f16],
-        data: &[f16],
+    fn assert_dot_paths_agree<T: MaybeF16>(
+        centroids: &[T::Native],
+        data: &[T::Native],
         dimension: usize,
         balance_factor: f32,
         cluster_sizes: Option<&[usize]>,
         ctx: &str,
-    ) {
+    ) where
+        T::Native: Dot + Sync,
+    {
         let k = centroids.len() / dimension;
         // The AMX path's own output, not `compute_membership_and_dist`'s: that
         // entry point falls back to the per-vector path whenever this one
         // declines, so going through it would silently degrade this into a
         // scalar-against-scalar comparison on any host or build that lacks the
         // kernel, and prove nothing about it.
-        let amx = dot_membership_amx_f16(centroids, data, dimension, balance_factor, cluster_sizes)
-            .unwrap_or_else(|| {
-                panic!("{ctx}: the AMX path declined this shape, so agreeing proves nothing")
-            });
+        let amx =
+            dot_membership_amx::<T>(centroids, data, dimension, balance_factor, cluster_sizes)
+                .unwrap_or_else(|| {
+                    panic!("{ctx}: the AMX path declined this shape, so agreeing proves nothing")
+                });
+        // f16 rows are reported exactly as the kernel scored them, so only fp16
+        // precision is promised, and only the kernel's summation order can move
+        // an assignment. A rounded column reports a distance recomputed from the
+        // original values -- hence the far tighter bound -- but rounding itself
+        // perturbs the *scores*, so near-ties are freer to change hands.
+        let (rel_tol, abs_tol, tie_gap) = if T::as_f16_slice(data).is_some() {
+            (AMX_REL_TOL, 1e-3, AMX_TIE_GAP)
+        } else {
+            (EXACT_REL_TOL, 1e-6, F32_CAST_TIE_GAP)
+        };
 
         for (i, vector) in data.chunks(dimension).enumerate() {
             let row = dot_distance_batch(vector, centroids, dimension).collect::<Vec<_>>();
@@ -2073,7 +2346,7 @@ mod tests {
             // pick different centroids, and then only this identity has to hold.
             let want_dist = row[got_id as usize];
             assert!(
-                (got_dist - want_dist).abs() <= AMX_REL_TOL * want_dist.abs() + 1e-3,
+                (got_dist - want_dist).abs() <= rel_tol * want_dist.abs() + abs_tol,
                 "{ctx}: row {i} centroid {got_id} distance {got_dist}, want {want_dist}"
             );
 
@@ -2085,7 +2358,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             biased.sort_by(f32::total_cmp);
-            if biased[1] - biased[0] > AMX_TIE_GAP {
+            if biased[1] - biased[0] > tie_gap {
                 assert_eq!(
                     got_id, want_id,
                     "{ctx}: row {i} is not a tie ({} vs {}) but the paths disagree",
@@ -2110,7 +2383,7 @@ mod tests {
                 for n in [64usize, 100, 1000] {
                     let centroids = random_f16(k * dimension, &mut rng);
                     let data = random_f16(n * dimension, &mut rng);
-                    assert_dot_paths_agree(
+                    assert_dot_paths_agree::<Float16Type>(
                         &centroids,
                         &data,
                         dimension,
@@ -2156,7 +2429,7 @@ mod tests {
                 "premise broken: a real centroid is nearer than the zero padding"
             );
         }
-        assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, "padding");
+        assert_dot_paths_agree::<Float16Type>(&centroids, &data, DIM, 0.0, None, "padding");
     }
 
     /// The bias path. `argmin_value_float_with_bias` minimizes `distance +
@@ -2178,7 +2451,7 @@ mod tests {
         let data = random_f16(N * DIM, &mut rng);
         let cluster_sizes = (0..K).map(|id| id * 4).collect::<Vec<_>>();
 
-        assert_dot_paths_agree(
+        assert_dot_paths_agree::<Float16Type>(
             &centroids,
             &data,
             DIM,
@@ -2227,7 +2500,7 @@ mod tests {
             data[row * DIM..(row + 1) * DIM].fill(f16::NAN);
         }
 
-        assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, "nan");
+        assert_dot_paths_agree::<Float16Type>(&centroids, &data, DIM, 0.0, None, "nan");
 
         let (membership, _) = KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
             &centroids,
@@ -2245,6 +2518,529 @@ mod tests {
                 "row {row} membership {cluster_id:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // fp32 rounded onto the same kernel
+    // -----------------------------------------------------------------------
+
+    /// The same shape sweep as [`test_dot_amx_matches_per_vector_path`], on fp32
+    /// input that has to be rounded into the kernel. The distance bound the
+    /// helper applies here is the tight one, so this also covers every shape for
+    /// the recomputation.
+    ///
+    /// Unit-length vectors, not raw `random_f32`, and the difference is not
+    /// cosmetic: at `dim = 768` unnormalized rows have norms around 16 and dot
+    /// products spread over ±9, so `1 - dot` passes through zero and the
+    /// relative half of the tolerance collapses to nothing, leaving only the
+    /// 1e-6 absolute floor against ~1e-5 of ordinary f32 summation noise. The
+    /// test would fail on a build whose baseline splits `dot` and `dot_batch`
+    /// onto different kernels. Normalized, the observed gap is 1.2e-7.
+    #[test]
+    fn test_dot_amx_f32_matches_per_vector_path() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        let mut rng = SmallRng::seed_from_u64(0xF32D07);
+        for k in [32usize, 64, 100] {
+            for dimension in [32usize, 64, 768] {
+                for n in [64usize, 100, 1000] {
+                    let centroids = random_unit_f32(k, dimension, &mut rng);
+                    let data = random_unit_f32(n, dimension, &mut rng);
+                    assert_dot_paths_agree::<Float32Type>(
+                        &centroids,
+                        &data,
+                        dimension,
+                        0.0,
+                        None,
+                        &format!("f32 k={k} dim={dimension} n={n}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bias path on a rounded column, where the two rules interact: the
+    /// argmin runs on `distance + bias`, but the distance the winner is reported
+    /// with is recomputed — and must be recomputed *without* the bias, matching
+    /// what `argmin_value_float_with_bias` would have reported. Adding the bias
+    /// back in would sail past the f16 tolerances and only fail here.
+    #[test]
+    fn test_dot_amx_f32_with_balance_bias() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 128;
+        const N: usize = 256;
+        const BALANCE_FACTOR: f32 = 0.02;
+
+        let mut rng = SmallRng::seed_from_u64(0xF32B1A5);
+        let centroids = random_f32(K * DIM, &mut rng);
+        let data = random_f32(N * DIM, &mut rng);
+        let cluster_sizes = (0..K).map(|id| id * 4).collect::<Vec<_>>();
+
+        assert_dot_paths_agree::<Float32Type>(
+            &centroids,
+            &data,
+            DIM,
+            BALANCE_FACTOR,
+            Some(&cluster_sizes),
+            "f32 bias",
+        );
+
+        let assign = |balance_factor, sizes| {
+            KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                &centroids,
+                &data,
+                DIM,
+                DistanceType::Dot,
+                balance_factor,
+                sizes,
+                None,
+            )
+            .0
+        };
+        assert_ne!(
+            assign(BALANCE_FACTOR, Some(cluster_sizes.as_slice())),
+            assign(0.0, None),
+            "the balance factor is too small to move any assignment"
+        );
+    }
+
+    /// What rounding an fp32 column to f16 actually costs, measured rather than
+    /// assumed: how often the winner changes, and how much extra distance the
+    /// vectors that changed hands end up paying.
+    ///
+    /// Both are asserted because only the second one matters. A vector that
+    /// changes hands between two centroids it is equidistant from has lost
+    /// nothing; the number that would show up as damage is the regret, and it
+    /// has to stay far below the distances themselves.
+    ///
+    /// Observed here: 99.90% of assignments unchanged, worst regret 6.7e-6
+    /// against a mean distance of 0.890 — the same shape of answer as the
+    /// 990k x 1536 dbpedia measurement quoted on `flat_amx_assignment_blocker`
+    /// (99.77% unchanged, 7.9e-5 against 0.208). The thresholds are set well
+    /// clear of both so this fails on a real regression, not on rng drift.
+    #[test]
+    fn test_dot_amx_f32_matches_the_exact_path() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 512;
+        const DIM: usize = 768;
+        const N: usize = 4096;
+
+        let mut rng = SmallRng::seed_from_u64(0xE8AC7);
+        let centroids = random_unit_f32(K, DIM, &mut rng);
+        let data = random_unit_f32(N, DIM, &mut rng);
+        let amx = dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None)
+            .expect("the AMX path declined a shape it should accept");
+
+        let mut agreed = 0usize;
+        let mut worst_regret = 0f32;
+        let mut mean_distance = 0f64;
+        for (i, vector) in data.chunks(DIM).enumerate() {
+            let row = dot_distance_batch(vector, &centroids, DIM).collect::<Vec<_>>();
+            let (want_id, best) =
+                argmin_value_float(row.iter().copied()).expect("finite input is always assigned");
+            let (got_id, _) = amx[i].expect("finite input is always assigned");
+            agreed += usize::from(got_id == want_id);
+            worst_regret = worst_regret.max(row[got_id as usize] - best);
+            mean_distance += best as f64;
+        }
+
+        let agreement = agreed as f64 / N as f64;
+        assert!(
+            agreement >= 0.99,
+            "rounding moved {:.3}% of assignments, over the 1% budget",
+            100.0 * (1.0 - agreement)
+        );
+        // Absolute, not relative to the distance: dot distances straddle zero,
+        // so a relative bound would be meaningless near the crossing. Set at 15x
+        // the observed 6.7e-6 -- loose enough to survive an rng or kernel
+        // change, tight enough that a real loss of precision fails here rather
+        // than surfacing as a recall number nobody was comparing.
+        assert!(
+            worst_regret < 1e-4,
+            "worst regret {worst_regret} against a mean distance of {:.4}",
+            mean_distance / N as f64
+        );
+    }
+
+    /// The recomputation itself, and proof that asserting it is not free.
+    ///
+    /// The first assertion pins that the reported distance is the exact fp32 one
+    /// for the centroid actually chosen. The second is what makes the first
+    /// load-bearing: it shows the kernel's own f16 score for that same pair sits
+    /// *outside* the tolerance, so dropping the recomputation would fail this
+    /// test rather than slip through.
+    #[test]
+    fn test_dot_amx_f32_reports_the_exact_f32_distance() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 768;
+        const N: usize = 256;
+
+        let mut rng = SmallRng::seed_from_u64(0xD157);
+        let centroids = random_f32(K * DIM, &mut rng);
+        let data = random_f32(N * DIM, &mut rng);
+        let amx = dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None)
+            .expect("the AMX path declined a shape it should accept");
+
+        let round = |values: &[f32]| {
+            values
+                .iter()
+                .map(|&v| f16::from_f32(v))
+                .collect::<Vec<f16>>()
+        };
+        let centroids_f16 = round(&centroids);
+        let mut worst_f16_gap = 0f32;
+        for (i, vector) in data.chunks(DIM).enumerate() {
+            let (id, got_dist) = amx[i].expect("finite input is always assigned");
+            let centroid = &centroids[id as usize * DIM..(id as usize + 1) * DIM];
+            let want = dot_distance(vector, centroid);
+            assert_eq!(
+                got_dist.to_bits(),
+                want.to_bits(),
+                "row {i}: reported {got_dist}, exact fp32 distance {want}"
+            );
+
+            let centroid_f16 = &centroids_f16[id as usize * DIM..(id as usize + 1) * DIM];
+            let rounded_dist = dot_distance(round(vector).as_slice(), centroid_f16);
+            worst_f16_gap = worst_f16_gap.max((rounded_dist - want).abs());
+        }
+        assert!(
+            worst_f16_gap > EXACT_REL_TOL,
+            "the f16 score is within {EXACT_REL_TOL} of the exact one, so this test \
+             would pass without the recomputation"
+        );
+    }
+
+    /// The per-vector path each row would have taken had the kernel never been
+    /// involved. The reference every fallback assertion below compares against.
+    fn per_vector_assignments(
+        centroids: &[f32],
+        data: &[f32],
+        dimension: usize,
+    ) -> Vec<Option<(u32, f32)>> {
+        data.chunks(dimension)
+            .map(|vector| {
+                argmin_value_float_with_bias(
+                    dot_distance_batch(vector, centroids, dimension),
+                    None::<std::iter::Empty<f32>>,
+                )
+            })
+            .collect()
+    }
+
+    /// A value f16 cannot hold takes its whole block back to the per-vector
+    /// path, and that path has to produce bit-identical results — not merely
+    /// close ones, since it is literally the same code the caller would have run.
+    ///
+    /// The assertion covers the *whole* affected block, which at these shapes is
+    /// 512 rows rather than the 32 of one tile pass: `to_f16_into` is called
+    /// once per block, so 512 rows share the verdict of one bad element. An
+    /// assertion sized to a tile pass would leave 94% of the fallback untested.
+    /// The block boundary comes from [`amx_block_rows`] rather than a literal,
+    /// so a change to the scratch budget cannot silently shrink what is checked.
+    ///
+    /// The input spans several blocks, so this also covers that the blocks
+    /// *without* the bad element keep using the kernel.
+    #[rstest]
+    #[case::overflow(1e30)]
+    #[case::infinity(f32::INFINITY)]
+    #[case::negative_infinity(f32::NEG_INFINITY)]
+    #[case::nan(f32::NAN)]
+    fn test_dot_amx_f32_unrepresentable_falls_back_bit_exactly(#[case] planted: f32) {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 64;
+        const N: usize = 2048;
+        const PLANTED_ROW: usize = 3;
+
+        let mut rng = SmallRng::seed_from_u64(0x0F10);
+        let centroids = random_unit_f32(K, DIM, &mut rng);
+        let mut data = random_unit_f32(N, DIM, &mut rng);
+        data[PLANTED_ROW * DIM + 5] = planted;
+
+        let amx = dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None)
+            .expect("the AMX path declined a shape it should accept");
+        let scalar = per_vector_assignments(&centroids, &data, DIM);
+
+        let block = amx_block_rows(K); // K is already a multiple of 32
+        assert!(
+            block < N,
+            "the input must span more than the affected block"
+        );
+        assert!(PLANTED_ROW < block, "the bad element must be in block 0");
+        assert_eq!(
+            &amx[..block],
+            &scalar[..block],
+            "the {block}-row block holding {planted} did not fall back bit-exactly"
+        );
+
+        for (i, (got, want)) in amx.iter().zip(scalar.iter()).enumerate().skip(block) {
+            let (Some((got_id, _)), Some((want_id, _))) = (got, want) else {
+                assert_eq!(
+                    got.is_none(),
+                    want.is_none(),
+                    "row {i}: {got:?} vs {want:?}"
+                );
+                continue;
+            };
+            // Rows outside the affected block still go through the kernel, so
+            // only near-ties may differ there.
+            let row = dot_distance_batch(&data[i * DIM..(i + 1) * DIM], &centroids, DIM)
+                .collect::<Vec<_>>();
+            let mut sorted = row.clone();
+            sorted.sort_by(f32::total_cmp);
+            if sorted[1] - sorted[0] > F32_CAST_TIE_GAP {
+                assert_eq!(
+                    got_id, want_id,
+                    "row {i} is not a tie but the paths disagree"
+                );
+            }
+        }
+    }
+
+    /// A bad element in a block that is *not* the first one, on a single worker
+    /// so the rounding scratch is provably reused across the two.
+    ///
+    /// `map_init` hands each rayon worker one buffer for the whole run, so a
+    /// clean block can be handed scratch a spoiled block wrote into. Nothing
+    /// else exercises that order: with the bad element in block 0 the reuse runs
+    /// the harmless way round, and with several workers the scheduler decides
+    /// whether it happens at all. One thread makes it deterministic.
+    #[test]
+    fn test_dot_amx_f32_fallback_does_not_poison_later_blocks() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 64;
+
+        let block = amx_block_rows(K);
+        let rows = 3 * block;
+        let spoiled = block + 5; // block 1, so blocks 0 and 2 are clean
+
+        let mut rng = SmallRng::seed_from_u64(0x510C);
+        let centroids = random_unit_f32(K, DIM, &mut rng);
+        let mut data = random_unit_f32(rows, DIM, &mut rng);
+        data[spoiled * DIM + 9] = 1e30;
+        let scalar = per_vector_assignments(&centroids, &data, DIM);
+
+        let pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let amx = pool
+            .install(|| dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None))
+            .expect("the AMX path declined a shape it should accept");
+
+        assert_eq!(
+            &amx[block..2 * block],
+            &scalar[block..2 * block],
+            "the spoiled block did not fall back bit-exactly"
+        );
+        // The clean blocks must still be *assigned* and correct. Checking their
+        // distances against the exact path is what would catch scratch carrying
+        // an infinity forward: a poisoned row scores NaN and goes unassigned.
+        for (i, got) in amx.iter().enumerate() {
+            if (block..2 * block).contains(&i) {
+                continue;
+            }
+            let (id, dist) = got
+                .unwrap_or_else(|| panic!("row {i} is in a clean block but came back unassigned"));
+            let vector = &data[i * DIM..(i + 1) * DIM];
+            let centroid = &centroids[id as usize * DIM..(id as usize + 1) * DIM];
+            assert_eq!(
+                dist.to_bits(),
+                dot_distance(vector, centroid).to_bits(),
+                "row {i} in a clean block"
+            );
+        }
+    }
+
+    /// A bad element in a *tail* row — one of the `rows % 32` that never reach a
+    /// tile pass.
+    ///
+    /// `to_f16_into` is only shown `[..tiled_len]`, so it cannot see this one at
+    /// all. The rows that do reach the kernel must therefore carry on using it,
+    /// and the tail row must come back exactly as the per-vector path leaves it:
+    /// `1e30` still has a nearest centroid, an infinity or a NaN has none.
+    #[rstest]
+    #[case::overflow(1e30)]
+    #[case::infinity(f32::INFINITY)]
+    #[case::nan(f32::NAN)]
+    fn test_dot_amx_f32_unrepresentable_tail_row_matches_the_scalar_path(#[case] planted: f32) {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 64;
+        const N: usize = 100; // 3 tile passes of 32, then 4 tail rows
+        const TAIL_ROW: usize = 98;
+
+        let mut rng = SmallRng::seed_from_u64(0x7A11);
+        let centroids = random_unit_f32(K, DIM, &mut rng);
+        let mut data = random_unit_f32(N, DIM, &mut rng);
+        data[TAIL_ROW * DIM + 1] = planted;
+
+        let amx = dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None)
+            .expect("the AMX path declined a shape it should accept");
+        let scalar = per_vector_assignments(&centroids, &data, DIM);
+
+        assert_eq!(
+            amx[TAIL_ROW], scalar[TAIL_ROW],
+            "the tail row holding {planted} did not match the per-vector path"
+        );
+        // The tiled rows never saw the bad element and must still be assigned
+        // with recomputed fp32 distances -- i.e. the block did not fall back.
+        for (i, got) in amx.iter().enumerate().take(96) {
+            let (id, dist) = got.unwrap_or_else(|| panic!("tiled row {i} came back unassigned"));
+            let vector = &data[i * DIM..(i + 1) * DIM];
+            let centroid = &centroids[id as usize * DIM..(id as usize + 1) * DIM];
+            assert_eq!(
+                dist.to_bits(),
+                dot_distance(vector, centroid).to_bits(),
+                "row {i}"
+            );
+        }
+    }
+
+    /// A centroid set that cannot be rounded declines the *whole* call, not one
+    /// block: the centroids are the GEMM's B operand, so an infinity there would
+    /// reach every vector's score rather than one row's.
+    #[test]
+    fn test_dot_amx_f32_unrepresentable_centroid_declines_the_call() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 64;
+
+        let mut rng = SmallRng::seed_from_u64(0xCE7);
+        let mut centroids = random_f32(K * DIM, &mut rng);
+        let data = random_f32(128 * DIM, &mut rng);
+        assert!(
+            dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None).is_some(),
+            "premise broken: this shape is served before the centroid is spoiled"
+        );
+
+        centroids[7 * DIM + 1] = 1e30;
+        assert!(
+            dot_membership_amx::<Float32Type>(&centroids, &data, DIM, 0.0, None).is_none(),
+            "an unrepresentable centroid must decline the call, not poison the GEMM"
+        );
+    }
+
+    /// Shapes the kernel is not worth entering for must decline on both element
+    /// types, so `flat_amx_assignment_blocker` can mirror the same bounds
+    /// without knowing which route the type takes.
+    #[test]
+    fn test_dot_amx_declines_shapes_below_one_tile_pass() {
+        let mut rng = SmallRng::seed_from_u64(0x5A11);
+        for (k, dimension) in [(31usize, 64usize), (64, 31), (31, 31)] {
+            let f16_centroids = random_f16(k * dimension, &mut rng);
+            let f16_data = random_f16(64 * dimension, &mut rng);
+            assert!(
+                dot_membership_amx::<Float16Type>(&f16_centroids, &f16_data, dimension, 0.0, None)
+                    .is_none(),
+                "f16 k={k} dim={dimension}"
+            );
+            let f32_centroids = random_f32(k * dimension, &mut rng);
+            let f32_data = random_f32(64 * dimension, &mut rng);
+            assert!(
+                dot_membership_amx::<Float32Type>(&f32_centroids, &f32_data, dimension, 0.0, None)
+                    .is_none(),
+                "f32 k={k} dim={dimension}"
+            );
+        }
+    }
+
+    /// f64 has no rounding to f16 defined, so it must decline before touching
+    /// any data — the `AMX_F16_CAPABLE` gate, not an accident of shape.
+    #[test]
+    fn test_dot_amx_declines_f64() {
+        const { assert!(!Float64Type::AMX_F16_CAPABLE) };
+        let centroids = vec![0.5f64; 64 * 64];
+        let data = vec![0.25f64; 64 * 64];
+        assert!(dot_membership_amx::<Float64Type>(&centroids, &data, 64, 0.0, None).is_none());
+    }
+
+    /// `MaybeF16`'s two routes into the kernel, checked against what they claim.
+    ///
+    /// f16's `to_f16_into` is never reached in production — `as_f16_slice` takes
+    /// that column first — so without this the trait could quietly acquire a
+    /// wrong implementation of it and nothing would notice.
+    #[test]
+    fn test_maybe_f16_rounding_routes() {
+        let mut rng = SmallRng::seed_from_u64(0x0117);
+        let source = random_f16(64, &mut rng);
+        let mut dst = vec![f16::ZERO; 64];
+        assert!(Float16Type::to_f16_into(&source, &mut dst));
+        assert_eq!(dst, source, "f16 must reach the kernel unchanged");
+
+        let source = random_f32(64, &mut rng);
+        assert!(Float32Type::to_f16_into(&source, &mut dst));
+        for (i, (&got, &want)) in dst.iter().zip(source.iter()).enumerate() {
+            assert_eq!(got, f16::from_f32(want), "element {i}");
+        }
+
+        let mut spoiled = source;
+        spoiled[9] = 1e30;
+        assert!(
+            !Float32Type::to_f16_into(&spoiled, &mut dst),
+            "an overflow must be reported, not rounded to an infinity"
+        );
+        assert!(!Float64Type::to_f16_into(&vec![0.5f64; 64], &mut dst));
+    }
+
+    /// The routing table, enumerated over every state the two kill switches can
+    /// leave the kernel in.
+    ///
+    /// Enumerated rather than derived on purpose. Both switches are read once
+    /// and cached in a `LazyLock`, so a test cannot set them; an assertion of
+    /// the form `routing(...) == amx_fp32_cast_available()` would then be
+    /// comparing the function against the very call it makes, and would hold
+    /// just as well if f16 and fp32 were wired to each other's switch. Taking
+    /// availability as an argument is what makes this a real table.
+    ///
+    /// The row that matters is `native && !rounded` — an operator running the
+    /// control arm with `LANCE_AMX_FP32_CAST=0`. fp32 must decline there while
+    /// f16 carries on, and `flat_amx_assignment_blocker` must agree, or that
+    /// build takes the exact path with no GEMM under it.
+    #[rstest]
+    #[case::everything_off(false, false, false, false)]
+    #[case::native_only(true, false, true, false)]
+    #[case::everything_on(true, true, true, true)]
+    // Not a state the switches produce -- `LANCE_DISABLE_AMX` outranks the cast
+    // -- but pinned so f16 answers from `native` alone rather than from
+    // whichever field happens to be set.
+    #[case::rounded_without_native(false, true, false, true)]
+    fn test_amx_dot_routing_table(
+        #[case] native: bool,
+        #[case] rounded: bool,
+        #[case] f16_routed: bool,
+        #[case] f32_routed: bool,
+    ) {
+        let amx = AmxAvailability { native, rounded };
+        assert_eq!(
+            amx_dot_routing_available::<Float16Type>(&[f16::ZERO; 64], amx),
+            f16_routed,
+            "f16 with {amx:?}"
+        );
+        assert_eq!(
+            amx_dot_routing_available::<Float32Type>(&[0.0f32; 64], amx),
+            f32_routed,
+            "f32 with {amx:?}"
+        );
+        assert!(
+            !amx_dot_routing_available::<Float64Type>(&[0.0f64; 64], amx),
+            "f64 has no route onto the kernel under any availability"
+        );
     }
 
     /// Wall-clock throughput of the dot-distance assignment the AMX path above

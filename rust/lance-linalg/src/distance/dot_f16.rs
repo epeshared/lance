@@ -3,10 +3,12 @@
 
 //! Batched f16 dot product with an optional AMX-FP16 tile backend.
 //!
-//! Used by IVF over an fp16 column under dot distance: [`dot_f16_batch_16`]
-//! scores one query against 16 centroids when choosing the partitions to probe,
-//! and the GEMM behind [`PackedCentroidsF16`] assigns vectors to partitions
-//! while an index is built.
+//! Used by IVF under dot distance: [`dot_f16_batch_16`] scores one query
+//! against 16 centroids when choosing the partitions to probe, and the GEMM
+//! behind [`PackedCentroidsF16`] assigns vectors to partitions while an index
+//! is built. An fp16 column reaches both with no conversion; an fp32 column
+//! reaches the GEMM through [`PackedCentroidsF16::from_f32`] and
+//! [`f32_to_f16_checked`], which round it to f16 first.
 //!
 //! [`dot_f16_batch_16`] returns the 16 raw dot products `Σ query·candidate`
 //! (same value convention as [`crate::distance::dot()`]); the caller applies the
@@ -15,13 +17,14 @@
 //! unavailability) it falls back to 16 independent [`crate::distance::dot()`]
 //! calls, which are bit-identical to the per-vector scalar path.
 //!
-//! Two gates cover all of this, and they are deliberately separate:
+//! Three gates cover all of this, and they are deliberately separate:
 //! [`amx_fp16_supported`] answers whether the tile instructions can run here at
-//! all, and [`amx_fp16_available`] adds the `LANCE_DISABLE_AMX` kill switch on
-//! top. The kernels here are guarded by the former so tests can always reach
-//! them; callers routing production work consult the latter. AMX is on by
-//! default — the switch exists for A/B measurement and for getting the previous
-//! path back without a rebuild.
+//! all, [`amx_fp16_available`] adds the `LANCE_DISABLE_AMX` kill switch on top,
+//! and [`amx_fp32_cast_available`] adds `LANCE_AMX_FP32_CAST` for the rounded
+//! fp32 path alone. The kernels here are guarded by the first so tests can
+//! always reach them; callers routing production work consult the other two.
+//! Both accelerated paths are on by default — the switches exist for A/B
+//! measurement and for getting the previous path back without a rebuild.
 //!
 //! Unlike integer AMX kernels this is floating point: the AMX and fallback paths
 //! are **not** bit-for-bit identical (tile accumulation order rounds
@@ -136,6 +139,130 @@ struct Packed {
 )))]
 enum Packed {}
 
+/// Rounds `src` into `dst` as f16, element for element.
+///
+/// Returns `false` if any output is non-finite while its input was finite (the
+/// magnitude overflowed f16's ~65504 range) or the input itself was non-finite.
+/// Both cases collapse to the same test because rounding maps an infinity or a
+/// NaN to itself: `dst[i]` is non-finite exactly when one of them happened.
+///
+/// A caller that gets `false` must run its own path over the *whole* buffer it
+/// passed. `TDPFP16PS` accumulates `dst[m][n] += Σ_k A[m][k]·B[k][n]`, so a row
+/// of A that rounded to an infinity spoils only that row's scores — but this
+/// function reports one bool for the whole call and cannot say which row it was.
+/// Reporting per row would mean a branch per element and cost the vectorization
+/// below, which is the trade this signature makes deliberately: the case is
+/// vanishingly rare, and falling back over a block of at most 512 rows is
+/// cheaper than slowing every block that has nothing wrong with it.
+///
+/// The scalar loop runs to the end rather than breaking on the first bad
+/// element, for the same reason.
+///
+/// # Rounding
+/// Bit-for-bit `f16::from_f32` on every input, including subnormals, the
+/// 65519/65520 overflow boundary, signed zeros, infinities and NaN payloads.
+/// The vector path is not an approximation of the scalar one: `VCVTPS2PH` under
+/// `_MM_FROUND_TO_NEAREST_INT` is the same instruction, with the same immediate,
+/// that `half` itself dispatches to on an F16C host.
+/// `f32_to_f16_vector_path_is_bit_identical` pins it.
+///
+/// # Panics
+/// If `src` and `dst` have different lengths.
+pub fn f32_to_f16_checked(src: &[f32], dst: &mut [f16]) -> bool {
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "source ({}) and destination ({}) must have the same length",
+        src.len(),
+        dst.len()
+    );
+    #[cfg(target_arch = "x86_64")]
+    if *F16C_SUPPORTED {
+        // SAFETY: the probe above is exactly this function's target-feature
+        // contract, and it is cached rather than re-run per element -- the
+        // reason this path exists at all, see `F16C_SUPPORTED`.
+        return unsafe { f32_to_f16_checked_f16c(src, dst) };
+    }
+    f32_to_f16_checked_scalar(src, dst)
+}
+
+/// Whether `VCVTPS2PH` can be reached here, probed once.
+///
+/// Caching is the entire point. `half`'s own `f32::from_f32` runs
+/// `is_x86_feature_detected!` per call and then enters an
+/// `#[target_feature(enable = "f16c")]` function, which cannot be inlined into a
+/// caller compiled without that feature — and this workspace's baseline is
+/// `x86-64-v2`, which has no F16C. The result is a real, unvectorizable call per
+/// element: measured at 0.878 ns/element against 0.092 for the loop below.
+#[cfg(target_arch = "x86_64")]
+static F16C_SUPPORTED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::arch::is_x86_feature_detected!("f16c") && std::arch::is_x86_feature_detected!("avx")
+});
+
+/// Eight elements per `VCVTPS2PH`, with the finiteness test folded into the same
+/// pass: an f16 is non-finite exactly when its exponent field is all ones, so
+/// `(bits & 0x7C00) == 0x7C00` answers it on the output the conversion just
+/// produced, with no second read and no widening back to f32.
+///
+/// The comparison results are OR-accumulated instead of being branched on, so
+/// the loop has no data-dependent control flow at all.
+///
+/// # Safety
+/// The host must support F16C and AVX; [`F16C_SUPPORTED`] is that check.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx")]
+unsafe fn f32_to_f16_checked_f16c(src: &[f32], dst: &mut [f16]) -> bool {
+    use std::arch::x86_64::{
+        __m128i, _MM_FROUND_TO_NEAREST_INT, _mm_and_si128, _mm_cmpeq_epi16, _mm_movemask_epi8,
+        _mm_or_si128, _mm_set1_epi16, _mm_setzero_si128, _mm_storeu_si128, _mm256_cvtps_ph,
+        _mm256_loadu_ps,
+    };
+    /// Round to nearest, ties to even, and the literal immediate `half`'s own
+    /// F16C path passes to `_mm_cvtps_ph` — which is what makes the two paths
+    /// bit-identical rather than merely close.
+    ///
+    /// `_MM_FROUND_NO_EXC` cannot be added: VCVTPS2PH reads only bits 2:0 of the
+    /// immediate (bit 2 selects MXCSR, bits 1:0 the rounding mode), it has no
+    /// exception-suppress bit, and `_mm256_cvtps_ph` rejects anything wider than
+    /// three bits at compile time. Exception masking is MXCSR's job here.
+    const ROUNDING: i32 = _MM_FROUND_TO_NEAREST_INT;
+    /// f16 exponent field: all ones means infinity or NaN.
+    const EXPONENT: i16 = 0x7C00u16 as i16;
+
+    let len = src.len();
+    let mut nonfinite = _mm_setzero_si128();
+    let exponent = _mm_set1_epi16(EXPONENT);
+    let mut i = 0;
+    while i + 8 <= len {
+        // SAFETY: `i + 8 <= len` and `dst.len() == len`, so both accesses stay
+        // in bounds; the loads and stores are the unaligned forms.
+        unsafe {
+            let wide = _mm256_loadu_ps(src.as_ptr().add(i));
+            let narrow = _mm256_cvtps_ph::<ROUNDING>(wide);
+            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), narrow);
+            nonfinite = _mm_or_si128(
+                nonfinite,
+                _mm_cmpeq_epi16(_mm_and_si128(narrow, exponent), exponent),
+            );
+        }
+        i += 8;
+    }
+    let all_finite = _mm_movemask_epi8(nonfinite) == 0;
+    all_finite & f32_to_f16_checked_scalar(&src[i..], &mut dst[i..])
+}
+
+/// The portable path, and the reference the vector one is checked against.
+/// Reached on a host without F16C, and on the last `len % 8` elements.
+fn f32_to_f16_checked_scalar(src: &[f32], dst: &mut [f16]) -> bool {
+    let mut all_finite = true;
+    for (out, &value) in dst.iter_mut().zip(src.iter()) {
+        let rounded = f16::from_f32(value);
+        *out = rounded;
+        all_finite &= rounded.is_finite();
+    }
+    all_finite
+}
+
 /// How many elements a buffer must hold for `m` rows of `row_len`, `stride`
 /// apart — `(m - 1) * stride + row_len` — or `None` if that overflows `usize`.
 ///
@@ -176,16 +303,71 @@ impl PackedCentroidsF16 {
     /// # Panics
     /// If `centroids` does not hold exactly `n * dim` values.
     pub fn new(centroids: &[f16], n: usize, dim: usize) -> Option<Self> {
+        Self::build(centroids.len(), n, dim, |padded| {
+            padded.copy_from_slice(centroids);
+            true
+        })
+    }
+
+    /// Packs `n` row-major `dim`-dimensional fp32 `centroids`, rounding them to
+    /// f16 on the way into the packed buffer, so an fp32 column can reach the
+    /// same GEMM without first materializing an f16 copy of the centroid set.
+    ///
+    /// `None` for every reason [`new`](Self::new) returns it, plus one more:
+    /// any centroid element that does not survive the rounding as a finite
+    /// value (see [`f32_to_f16_checked`]). That case is refused rather than
+    /// packed because a centroid is the GEMM's B operand — an infinity there
+    /// reaches every vector's score, not just one row's — so the caller has to
+    /// fall back for the whole call, and it can only do that if it hears about
+    /// it here.
+    ///
+    /// Rounding costs `O(n * dim)` once, against the `O(m * n * dim)` GEMM it
+    /// feeds, so it is not worth a separate representation decision.
+    ///
+    /// # Panics
+    /// If `centroids` does not hold exactly `n * dim` values.
+    pub fn from_f32(centroids: &[f32], n: usize, dim: usize) -> Option<Self> {
+        Self::build(centroids.len(), n, dim, |padded| {
+            f32_to_f16_checked(centroids, padded)
+        })
+    }
+
+    /// The shape validation, padded allocation and VNNI packing both
+    /// constructors share. `fill` writes the `n * dim` real centroids into the
+    /// head of the zero-padded buffer and answers whether they could be
+    /// represented at all; `false` declines the construction the same way an
+    /// unsupported host does.
+    fn build(
+        source_len: usize,
+        n: usize,
+        dim: usize,
+        fill: impl FnOnce(&mut [f16]) -> bool,
+    ) -> Option<Self> {
         let expected = n
             .checked_mul(dim)
             .unwrap_or_else(|| panic!("centroid shape n = {n} x dim = {dim} overflows usize"));
         assert_eq!(
-            centroids.len(),
-            expected,
-            "centroids must hold n*dim = {expected} values, got {}",
-            centroids.len()
+            source_len, expected,
+            "centroids must hold n*dim = {expected} values, got {source_len}"
         );
         if n == 0 || dim == 0 || !amx_fp16_supported() {
+            return None;
+        }
+        // Same checked-size contract as the length guards in `score`: this
+        // allocation is what the kernel later reads through a raw pointer, so a
+        // shape whose padded size is not representable is rejected here rather
+        // than wrapped into an allocation smaller than the rows the kernel will
+        // address. `packed_centroids_len` needs no separate check --
+        // `(dim / 32) * (n_padded / 16) * 512 <= n_padded * dim` for every
+        // input, so it cannot overflow once this one holds.
+        let n_padded = n
+            .checked_next_multiple_of(32)
+            .unwrap_or_else(|| panic!("padding n = {n} up to a multiple of 32 overflows usize"));
+        let padded_len = n_padded.checked_mul(dim).unwrap_or_else(|| {
+            panic!("padded centroid shape {n_padded} x dim = {dim} overflows usize")
+        });
+        let mut padded = vec![f16::ZERO; padded_len];
+        if !fill(&mut padded[..expected]) {
             return None;
         }
         #[cfg(all(
@@ -194,21 +376,6 @@ impl PackedCentroidsF16 {
             target_os = "linux"
         ))]
         {
-            // Same checked-size contract as the length guards below: this
-            // allocation is what the kernel later reads through a raw pointer,
-            // so a shape whose padded size is not representable is rejected
-            // here rather than wrapped into an allocation smaller than the rows
-            // the kernel will address. `packed_centroids_len` needs no separate
-            // check -- `(dim / 32) * (n_padded / 16) * 512 <= n_padded * dim`
-            // for every input, so it cannot overflow once this one holds.
-            let n_padded = n.checked_next_multiple_of(32).unwrap_or_else(|| {
-                panic!("padding n = {n} up to a multiple of 32 overflows usize")
-            });
-            let padded_len = n_padded.checked_mul(dim).unwrap_or_else(|| {
-                panic!("padded centroid shape {n_padded} x dim = {dim} overflows usize")
-            });
-            let mut padded = vec![f16::ZERO; padded_len];
-            padded[..centroids.len()].copy_from_slice(centroids);
             let mut packed =
                 Vec::with_capacity(crate::simd::amx_fp16::packed_centroids_len(n_padded, dim));
             crate::simd::amx_fp16::pack_centroids_vnni(&padded, n_padded, dim, &mut packed);
@@ -378,7 +545,7 @@ pub fn amx_fp16_supported() -> bool {
 ///
 /// Note this changes *which algorithm* an index build uses, not just how fast it
 /// runs: without the GEMM, partition assignment falls back to an approximate
-/// graph lookup (see `lance_index`'s `prefers_flat_amx_assignment`). Two indexes
+/// graph lookup (see `lance_index`'s `flat_amx_assignment_blocker`). Two indexes
 /// built on either side of this variable are not interchangeable.
 pub fn amx_fp16_available() -> bool {
     !amx_fp16_disabled() && amx_fp16_supported()
@@ -402,6 +569,51 @@ fn is_amx_disable_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "on"
+    )
+}
+
+/// Whether an fp32 column may be rounded to f16 to reach the AMX-FP16 kernels.
+///
+/// The kernels only take f16, so serving fp32 data with them means rounding
+/// each block of vectors on the way in. That is a real (if small) change in
+/// what gets computed, so it has its own switch on top of
+/// [`amx_fp16_available`]: `LANCE_AMX_FP32_CAST=0` (or `false` / `off`,
+/// case-insensitive, surrounding whitespace ignored) takes *only* the rounded
+/// path out of service and leaves a native f16 column on the kernels
+/// untouched; every other value, and an unset variable, leave it in.
+///
+/// **The cast is on by default**, and the switch exists to make an A/B
+/// measurement possible from one binary: fp32 data with and without the cast,
+/// no rebuild in between. `LANCE_DISABLE_AMX` still wins over it — with AMX out
+/// of service there is no kernel to cast anything for.
+///
+/// The same caveat as [`amx_fp16_available`] applies, and for the same reason:
+/// this changes which algorithm an fp32 index build uses, not just how fast it
+/// runs, so every caller routing work on it must agree. In `lance_index` that
+/// means `flat_amx_assignment_blocker` and the gate in
+/// `compute_membership_and_dist` both consult it.
+pub fn amx_fp32_cast_available() -> bool {
+    !amx_fp32_cast_disabled() && amx_fp16_available()
+}
+
+/// The `LANCE_AMX_FP32_CAST` switch on its own, read once and cached, for the
+/// same reasons as [`amx_fp16_disabled`].
+fn amx_fp32_cast_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("LANCE_AMX_FP32_CAST").is_ok_and(|value| is_cast_off_value(&value))
+    })
+}
+
+/// The accepted spellings of "off" for `LANCE_AMX_FP32_CAST`. Mirrored from
+/// [`is_amx_disable_value`] with the polarity flipped — this variable names the
+/// feature rather than its negation, so `0` is what turns it off — and with the
+/// same rule for everything else: an unrecognised value leaves the default (on)
+/// in place rather than half-honouring a request nobody can read back.
+fn is_cast_off_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off"
     )
 }
 
@@ -578,6 +790,219 @@ mod tests {
                 "{value:?} should not disable AMX"
             );
         }
+    }
+
+    /// The `LANCE_AMX_FP32_CAST` truth table, pinned for the same reasons as
+    /// [`amx_disable_flag_accepts_only_explicit_on`] — with the polarity
+    /// flipped, because this variable names the feature rather than its
+    /// negation. The two must not be confused: `LANCE_AMX_FP32_CAST=1` means
+    /// *on*, whereas `1` on the other variable means *off*.
+    #[test]
+    fn fp32_cast_flag_accepts_only_explicit_off() {
+        for value in ["0", "false", "off", "FALSE", "Off", " 0 ", "false\n"] {
+            assert!(
+                is_cast_off_value(value),
+                "{value:?} should disable the cast"
+            );
+        }
+        for value in ["", " ", "1", "true", "on", "no", "yes", "2", "disable"] {
+            assert!(
+                !is_cast_off_value(value),
+                "{value:?} should not disable the cast"
+            );
+        }
+    }
+
+    /// With the cast switch unset, the rounded fp32 path is available exactly
+    /// when the native f16 one is — the cast adds no capability requirement of
+    /// its own, only an opt-out. Derived rather than hardcoded so it holds on a
+    /// host without AMX too.
+    #[test]
+    fn fp32_cast_is_available_by_default_wherever_amx_is() {
+        if std::env::var_os("LANCE_AMX_FP32_CAST").is_some() {
+            return; // the switch is under test above; respect it here
+        }
+        assert_eq!(amx_fp32_cast_available(), amx_fp16_available());
+    }
+
+    /// The rounding helper's contract: values inside f16's range come back
+    /// rounded and accepted, and every way of leaving that range is rejected —
+    /// overflow from a finite input, and a non-finite input carried through.
+    #[test]
+    fn f32_to_f16_checked_accepts_representable_and_rejects_the_rest() {
+        let src = [0.0f32, -1.5, 65504.0, -65504.0, 1e-9, 0.1];
+        let mut dst = [f16::ZERO; 6];
+        assert!(f32_to_f16_checked(&src, &mut dst));
+        for (i, (&got, &want)) in dst.iter().zip(src.iter()).enumerate() {
+            assert_eq!(got, f16::from_f32(want), "element {i}");
+        }
+        // 1e-9 is below half of f16's smallest subnormal and rounds to zero.
+        // That is a representable, finite answer, so it must be accepted rather
+        // than treated as a loss of the whole block.
+        assert_eq!(dst[4], f16::ZERO);
+
+        for bad in [1e30f32, -1e30, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let src = [1.0f32, bad, 2.0];
+            let mut dst = [f16::ZERO; 3];
+            assert!(
+                !f32_to_f16_checked(&src, &mut dst),
+                "{bad} must be refused rather than rounded to an infinity"
+            );
+        }
+    }
+
+    /// Every f32 whose rounding is worth arguing about, plus the boundaries
+    /// where a wrong rounding mode or a wrong overflow threshold would show up.
+    fn rounding_edge_cases() -> Vec<f32> {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            // The overflow boundary: 65519 is the largest integer that still
+            // rounds down to f16::MAX, 65520 the smallest that becomes an
+            // infinity. A conversion rounding toward zero would keep both
+            // finite, which is exactly the kind of mistake this pins.
+            65503.0,
+            65504.0,
+            65519.0,
+            65520.0,
+            -65519.0,
+            -65520.0,
+            1e-9, // below half a subnormal step: must round to zero
+        ];
+        // Exact ties and near-ties around anchors chosen for what they border:
+        // zero, the smallest subnormal, the subnormal/normal boundary, 1.0, and
+        // the largest finite f16. Built by bisecting adjacent f16 values rather
+        // than typed as decimals -- a decimal literal rounded to f32 usually is
+        // not a tie at all, and the test would then pass under any rounding
+        // mode, which is precisely what it exists to rule out.
+        for bits in [0x0000u16, 0x0001, 0x03FE, 0x03FF, 0x3C00, 0x7BFE] {
+            let low = f16::from_bits(bits).to_f32();
+            let step = f16::from_bits(bits + 1).to_f32() - low;
+            for fraction in [0.25f32, 0.5, 0.75] {
+                values.push(low + step * fraction);
+                values.push(-(low + step * fraction));
+            }
+        }
+        // And a broad sweep: the whole f16 range plus values that overflow it,
+        // the unit range real embeddings live in, and arbitrary bit patterns so
+        // NaN payloads and wild exponents are covered too.
+        let mut rng = StdRng::seed_from_u64(0xE06E);
+        values.extend((0..4096).map(|_| rng.random_range(-70000.0f32..70000.0)));
+        values.extend((0..4096).map(|_| rng.random_range(-1.0f32..1.0)));
+        values.extend((0..1024).map(|_| f32::from_bits(rng.random::<u32>())));
+        values
+    }
+
+    /// The vector path must be `f16::from_f32` bit for bit — not an
+    /// approximation of it.
+    ///
+    /// This is the assertion that makes the 9.5x rewrite safe to have made. Two
+    /// mistakes it catches and nothing else would: a rounding mode other than
+    /// ties-to-even (which moves roughly one value in a thousand, invisible in
+    /// any recall number), and an overflow threshold off by one representable
+    /// step at 65519/65520.
+    ///
+    /// The scalar path is the reference because it is `f16::from_f32` by
+    /// construction. Every offset in `0..8` is exercised so the `len % 8` tail
+    /// is covered at every alignment of the split.
+    #[test]
+    fn f32_to_f16_vector_path_is_bit_identical() {
+        let values = rounding_edge_cases();
+        for offset in 0..8 {
+            let src = &values[offset..];
+            let mut dispatched = vec![f16::ZERO; src.len()];
+            let mut scalar = vec![f16::ZERO; src.len()];
+            let got = f32_to_f16_checked(src, &mut dispatched);
+            let want = f32_to_f16_checked_scalar(src, &mut scalar);
+
+            for (i, (&a, &b)) in dispatched.iter().zip(scalar.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "offset {offset} element {i}: input {} rounded to {a} (0x{:04x}), \
+                     f16::from_f32 gives {b} (0x{:04x})",
+                    src[i],
+                    a.to_bits(),
+                    b.to_bits(),
+                );
+            }
+            assert_eq!(got, want, "offset {offset}: finiteness verdicts disagree");
+        }
+    }
+
+    /// The verdict itself, over the same inputs: `false` exactly when some
+    /// output is an infinity or a NaN. Asserted against a from-scratch scan so a
+    /// vectorized accumulator that drops a lane cannot pass.
+    #[test]
+    fn f32_to_f16_checked_reports_every_non_finite_lane() {
+        let values = rounding_edge_cases();
+        // Lengths straddling the 8-wide step so a bad element lands in the
+        // vector body, in the tail, and as the only element.
+        for len in [1usize, 7, 8, 9, 15, 16, 17, 64, values.len()] {
+            for start in [0usize, 1, 5] {
+                let src = &values[start..(start + len).min(values.len())];
+                let mut dst = vec![f16::ZERO; src.len()];
+                let got = f32_to_f16_checked(src, &mut dst);
+                let want = dst.iter().all(|v| v.is_finite());
+                assert_eq!(got, want, "len {len} start {start}");
+            }
+        }
+        // An all-finite buffer with one bad element at each position in turn.
+        let mut src = vec![0.5f32; 40];
+        let mut dst = vec![f16::ZERO; 40];
+        assert!(f32_to_f16_checked(&src, &mut dst));
+        for i in 0..src.len() {
+            src[i] = 1e30;
+            assert!(!f32_to_f16_checked(&src, &mut dst), "bad element at {i}");
+            src[i] = 0.5;
+        }
+    }
+
+    /// `from_f32` must produce the same packed centroids as rounding first and
+    /// calling `new`, and must decline a centroid set it cannot represent
+    /// instead of packing infinities the GEMM would spread across every score.
+    #[test]
+    fn from_f32_matches_rounding_then_new_and_refuses_overflow() {
+        let mut rng = StdRng::seed_from_u64(0x3232);
+        let (n, dim) = (48usize, 64usize);
+        let centroids_f32: Vec<f32> = (0..n * dim)
+            .map(|_| rng.random_range(-1.0f32..1.0))
+            .collect();
+        let centroids_f16: Vec<f16> = centroids_f32.iter().map(|&v| f16::from_f32(v)).collect();
+
+        let Some(from_f32) = PackedCentroidsF16::from_f32(&centroids_f32, n, dim) else {
+            return; // no AMX-FP16 on this build or host
+        };
+        let rounded_first =
+            PackedCentroidsF16::new(&centroids_f16, n, dim).expect("availability was just proven");
+
+        let m = 32;
+        let data: Vec<f16> = (0..m * dim)
+            .map(|_| f16::from_f32(rng.random_range(-1.0f32..1.0)))
+            .collect();
+        let n_padded = from_f32.num_centroids_padded();
+        assert_eq!(n_padded, rounded_first.num_centroids_padded());
+        let mut a = vec![f32::NAN; m * n_padded];
+        let mut b = vec![f32::NAN; m * n_padded];
+        from_f32.score(&data, m, dim, &mut a, n_padded);
+        rounded_first.score(&data, m, dim, &mut b, n_padded);
+        assert_eq!(a, b, "from_f32 packed something other than the rounding");
+
+        let mut overflowing = centroids_f32;
+        overflowing[n * dim - 1] = 1e30;
+        assert!(
+            PackedCentroidsF16::from_f32(&overflowing, n, dim).is_none(),
+            "a centroid that overflows f16 must decline the whole construction"
+        );
     }
 
     /// With the kill switch unset, availability is exactly hardware support.
@@ -1177,6 +1602,63 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// Rounding throughput, per element, for the dispatched path against the
+    /// scalar one it replaced.
+    ///
+    /// This ratio is load-bearing for the fp32 partition-assignment path, which
+    /// rounds every block of vectors on the way into the GEMM: at `dim = 1536,
+    /// k = 2048` the rounding and the GEMM are within 2x of each other, so a
+    /// per-element function call — which is what `f16::from_f32` compiles to
+    /// under this workspace's pre-F16C baseline — is not a rounding error in the
+    /// budget, it *is* the budget.
+    ///
+    /// `#[ignore]` -- run:
+    ///   cargo test -p lance-linalg --release \
+    ///     f32_to_f16_conversion_bench -- --ignored --nocapture
+    /// Tune with `BENCH_ELEMS` and `BENCH_SECONDS`.
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stderr)]
+    fn f32_to_f16_conversion_bench() {
+        use std::time::{Duration, Instant};
+
+        let elems: usize = std::env::var("BENCH_ELEMS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24_576); // one 32 x 768 block, the shape the caller uses
+        let budget = Duration::from_secs_f64(
+            std::env::var("BENCH_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3.0),
+        );
+
+        let mut rng = StdRng::seed_from_u64(0xC047);
+        let src: Vec<f32> = (0..elems).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+        let mut dst = vec![f16::ZERO; elems];
+
+        let mut measure = |name: &str, convert: &dyn Fn(&[f32], &mut [f16]) -> bool| {
+            convert(&src, &mut dst); // untimed warm-up
+            let start = Instant::now();
+            let mut calls = 0usize;
+            while start.elapsed() < budget {
+                std::hint::black_box(convert(&src, &mut dst));
+                calls += 1;
+            }
+            let ns_per_element = start.elapsed().as_secs_f64() * 1e9 / (calls * elems) as f64;
+            eprintln!(
+                "[f32_to_f16_bench] {name:<10} elems={elems} calls={calls:>8} \
+                 ns_per_element={ns_per_element:.4} us_per_call={:.2}",
+                ns_per_element * elems as f64 / 1e3,
+            );
+            ns_per_element
+        };
+
+        let scalar = measure("scalar", &f32_to_f16_checked_scalar);
+        let dispatched = measure("dispatched", &f32_to_f16_checked);
+        eprintln!("[f32_to_f16_bench] speedup={:.2}x", scalar / dispatched);
     }
 
     /// The two costs a membership-level benchmark cannot separate: packing the
