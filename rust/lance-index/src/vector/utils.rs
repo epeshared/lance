@@ -46,6 +46,61 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
     }
 });
 
+/// Shape of the approximate assignment path: how wide the top-1 centroid lookup
+/// searches, and how rich the graph it searches is.
+///
+/// Every vector in the dataset runs one `ef`-wide graph search to pick its
+/// partition, so these are the knobs that trade assignment accuracy against
+/// assignment cost on that path. They are read from the environment rather than
+/// hardcoded because the case for exact assignment rests on a comparison against
+/// them: "exact beats the graph lookup" is only interesting if the graph lookup
+/// cannot buy the gap back more cheaply by searching wider, or by being built
+/// better. Neither question can be asked while the values are literals.
+///
+/// The defaults are the historical ones -- `ef = 15` at query time over a graph
+/// built at `ef_construction = 15` with 12 edges per node, which is a deliberately
+/// minimal graph: it covers `num_centroids` nodes, not the dataset, so it is cheap
+/// either way. Values that do not parse, or are zero, fall back to the default
+/// rather than erroring; this is a measurement surface on a path that has no other
+/// configuration, and failing an index build over a malformed environment variable
+/// would be the worse outcome.
+struct ApproxAssignParams {
+    ef: usize,
+    ef_construction: usize,
+    num_edges: usize,
+}
+
+static APPROX_ASSIGN: LazyLock<ApproxAssignParams> = LazyLock::new(|| {
+    fn read(var: &str, default: usize) -> usize {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    }
+    let p = ApproxAssignParams {
+        ef: read("LANCE_HNSW_ASSIGN_EF", 15),
+        ef_construction: read("LANCE_HNSW_ASSIGN_EF_CONSTRUCTION", 15),
+        num_edges: read("LANCE_HNSW_ASSIGN_EDGES", 12),
+    };
+    // Emitted unconditionally so an A/B run can confirm which arm it is in from
+    // the log of every arm, including the one left on the defaults -- "no line"
+    // is not evidence that the default was used. `info!` once the shape moves off
+    // the defaults, because that changes index quality and a mislabeled arm is
+    // worse than a log line; `debug!` otherwise. Once per process either way.
+    let line = format!(
+        "IVF partition assignment: approximate graph lookup ef={}, \
+         ef_construction={}, num_edges={} (defaults 15/15/12)",
+        p.ef, p.ef_construction, p.num_edges
+    );
+    if (p.ef, p.ef_construction, p.num_edges) == (15, 15, 12) {
+        debug!("{line}");
+    } else {
+        log::info!("{line}");
+    }
+    p
+});
+
 /// How many centroid values (`num_centroids * dimension`) it takes before an
 /// approximate index over the centroids pays for the cost of building it.
 /// Benchmarked at 1024 centroids x 1024 dimensions, where it made assignment 2x
@@ -267,11 +322,15 @@ impl SimpleIndex {
         let hnsw = match &store {
             SimpleStore::Float(store) => HNSW::index_vectors(
                 store,
-                HnswBuildParams::default().ef_construction(15).num_edges(12),
+                HnswBuildParams::default()
+                    .ef_construction(APPROX_ASSIGN.ef_construction)
+                    .num_edges(APPROX_ASSIGN.num_edges),
             )?,
             SimpleStore::Binary(store) => HNSW::index_vectors(
                 store,
-                HnswBuildParams::default().ef_construction(15).num_edges(12),
+                HnswBuildParams::default()
+                    .ef_construction(APPROX_ASSIGN.ef_construction)
+                    .num_edges(APPROX_ASSIGN.num_edges),
             )?,
         };
         Ok(Self { store, index: hnsw })
@@ -337,7 +396,7 @@ impl SimpleIndex {
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
         let params = HnswQueryParams {
-            ef: 15,
+            ef: APPROX_ASSIGN.ef,
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
